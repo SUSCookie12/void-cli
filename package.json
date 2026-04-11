@@ -1,19 +1,18 @@
 {
   "name": "void-server",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Void Server Daemon — Minecraft Server Management",
   "type": "module",
   "main": "dist/bundle.cjs",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --alias:yoga-wasm-web/auto=yoga-wasm-web/asm --alias:yoga-wasm-web=yoga-wasm-web/asm --loader:.wasm=file --outfile=dist/voidmc.cjs",
-    "postbuild": "node -e \"const fs=require('fs');const path=require('path');const src=path.join('node_modules','yoga-wasm-web','dist','yoga.wasm');const dst=path.join('dist','yoga.wasm');if(fs.existsSync(src)){fs.copyFileSync(src,dst);console.log('Copied yoga.wasm -> dist/yoga.wasm');}\"",
-    "package:win": "pkg dist/voidmc.cjs --targets node18-win-x64 --output dist/voidmc.exe --compress GZip --no-bytecode --public",
-    "package:linux": "pkg dist/voidmc.cjs --targets node18-linux-x64 --output dist/voidmc-linux --compress GZip --no-bytecode --public",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --alias:yoga-wasm-web/auto=./src/shims/yoga-wasm-auto.ts --outfile=dist/bundle.cjs",
+    "package:win": "pkg . --targets node18-win-x64 --output dist/voidmc.exe --compress GZip --public",
+    "package:linux": "pkg . --targets node18-linux-x64 --output dist/voidmc-linux --compress GZip --public",
     "package:all": "npm run build && npm run package:win && npm run package:linux"
   },
   "bin": {
-    "voidmc": "dist/bundle.mjs"
+    "voidmc": "launcher.cjs"
   },
   "dependencies": {
     "@types/node": "^25.6.0",
@@ -47,8 +46,7 @@
   },
   "pkg": {
     "assets": [
-      "dist/voidmc.cjs",
-      "dist/yoga.wasm"
+      "dist/bundle.cjs"
     ]
   }
 }
