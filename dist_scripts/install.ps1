@@ -1,10 +1,12 @@
 # install.ps1 - Void CLI Windows Installer
-# Usage: iwr https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.ps1 -useb | iex
+# Usage: iwr "https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.ps1" -useb | iex
 
 $repo = "SUSCookie12/void-cli"
 $installDir = "$HOME\.void"
 $binName = "voidmc.exe"
-$url = "https://github.com/$repo/releases/latest/download/voidmc.exe"
+$versionTag = "v0.1.2"
+$urlPinned = "https://github.com/$repo/releases/download/$versionTag/$binName"
+$urlLatest = "https://github.com/$repo/releases/latest/download/$binName"
 
 Write-Host "🌑 Initializing Void CLI Installation..." -ForegroundColor Cyan
 
@@ -12,18 +14,16 @@ if (!(Test-Path $installDir)) {
     New-Item -ItemType Directory -Path $installDir | Out-Null
 }
 
-# Download latest release
 Write-Host "Downloading Void CLI from GitHub..." -ForegroundColor Yellow
 try {
-    # Try latest first, then fallback to v0.1.0
-    Invoke-WebRequest -Uri $url -OutFile "$installDir\$binName" -ErrorAction Stop
+    Invoke-WebRequest -Uri $urlPinned -OutFile "$installDir\$binName" -ErrorAction Stop
+    Write-Host "Downloaded release $versionTag" -ForegroundColor Gray
 } catch {
-    Write-Host "Warning: 'Latest' download failed, trying hardcoded v0.1.0 fallback..." -ForegroundColor Gray
-    $fallbackUrl = "https://github.com/$repo/releases/download/v0.1.0/void-server-win.exe"
+    Write-Host "Warning: Could not download $versionTag, trying latest release..." -ForegroundColor Gray
     try {
-        Invoke-WebRequest -Uri $fallbackUrl -OutFile "$installDir\$binName" -ErrorAction Stop
+        Invoke-WebRequest -Uri $urlLatest -OutFile "$installDir\$binName" -ErrorAction Stop
     } catch {
-        Write-Host "❌ Error: Could not find the file on GitHub. Please ensure you have a Release named 'v0.1.0' with 'void-server-win.exe' attached." -ForegroundColor Red
+        Write-Host "❌ Error: Could not download $binName. Create a GitHub Release with tag $versionTag (or publish latest) and attach $binName." -ForegroundColor Red
         return
     }
 }
