@@ -4,7 +4,7 @@
 $repo = "SUSCookie12/void-cli"
 $installDir = "$HOME\.void"
 $binName = "voidmc.exe"
-$url = "https://github.com/$repo/releases/latest/download/void-server-win.exe"
+$url = "https://github.com/$repo/releases/latest/download/voidmc.exe"
 
 Write-Host "🌑 Initializing Void CLI Installation..." -ForegroundColor Cyan
 

@@ -7,7 +7,7 @@ set -e
 REPO="SUSCookie12/void-cli"
 INSTALL_DIR="$HOME/.void"
 BIN_NAME="voidmc"
-BIN_URL="https://github.com/$REPO/releases/latest/download/void-server-linux"
+BIN_URL="https://github.com/SUSCookie12/void-cli/releases/latest/download/voidmc-linux"
 
 echo "🌑 Initializing Void CLI Installation..."
 
