@@ -6,10 +6,10 @@
   "main": "dist/bundle.cjs",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node20 --format=esm --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --loader:.wasm=file --banner:js=\"import{createRequire}from 'module';import{fileURLToPath}from 'url';import{dirname}from 'path';const require=createRequire(import.meta.url);const __filename=fileURLToPath(import.meta.url);const __dirname=dirname(__filename);\" --outfile=dist/bundle.mjs",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --alias:yoga-wasm-web/auto=yoga-wasm-web/asm --alias:yoga-wasm-web=yoga-wasm-web/asm --loader:.wasm=file --outfile=dist/voidmc.cjs",
     "postbuild": "node -e \"const fs=require('fs');const path=require('path');const src=path.join('node_modules','yoga-wasm-web','dist','yoga.wasm');const dst=path.join('dist','yoga.wasm');if(fs.existsSync(src)){fs.copyFileSync(src,dst);console.log('Copied yoga.wasm -> dist/yoga.wasm');}\"",
-    "package:win": "pkg . --targets node18-win-x64 --output dist/voidmc.exe --compress GZip --no-bytecode --public",
-    "package:linux": "pkg . --targets node18-linux-x64 --output dist/voidmc-linux --compress GZip --no-bytecode --public",
+    "package:win": "pkg dist/voidmc.cjs --targets node18-win-x64 --output dist/voidmc.exe --compress GZip --no-bytecode --public",
+    "package:linux": "pkg dist/voidmc.cjs --targets node18-linux-x64 --output dist/voidmc-linux --compress GZip --no-bytecode --public",
     "package:all": "npm run build && npm run package:win && npm run package:linux"
   },
   "bin": {
@@ -47,7 +47,7 @@
   },
   "pkg": {
     "assets": [
-      "dist/voidmc.js",
+      "dist/voidmc.cjs",
       "dist/yoga.wasm"
     ]
   }
