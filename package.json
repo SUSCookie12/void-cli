@@ -1,0 +1,47 @@
+{
+  "name": "void-server",
+  "version": "0.1.0",
+  "description": "Void Server Daemon — Minecraft Server Management",
+  "type": "module",
+  "main": "dist/bundle.cjs",
+  "scripts": {
+    "dev": "tsx src/index.ts",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --loader:.wasm=file --banner:js=\"import{createRequire}from 'module';import{fileURLToPath}from 'url';import{dirname}from 'path';const require=createRequire(import.meta.url);const __filename=fileURLToPath(import.meta.url);const __dirname=dirname(__filename);\" --outfile=dist/bundle.mjs",
+    "postbuild": "node -e \"const fs=require('fs');const path=require('path');const src=path.join('node_modules','yoga-wasm-web','dist','yoga.wasm');const dst=path.join('dist','yoga.wasm');if(fs.existsSync(src)){fs.copyFileSync(src,dst);console.log('Copied yoga.wasm -> dist/yoga.wasm');}\"",
+    "package:win": "pkg dist/bundle.mjs --targets node18-win-x64 --output dist/void-server-win.exe --compress GZip --no-bytecode --public-packages \"*\" --public",
+    "package:linux": "pkg dist/bundle.mjs --targets node18-linux-x64 --output dist/void-server-linux --compress GZip --no-bytecode --public-packages \"*\" --public",
+    "package:all": "npm run build && npm run package:win && npm run package:linux"
+  },
+  "bin": {
+    "void-server": "dist/bundle.cjs"
+  },
+  "dependencies": {
+    "@types/node": "^25.6.0",
+    "adm-zip": "^0.5.17",
+    "chalk": "^5.3.0",
+    "firebase": "^10.12.0",
+    "ink": "^4.4.1",
+    "ink-select-input": "^5.0.0",
+    "ink-spinner": "^5.0.0",
+    "ink-text-input": "^5.0.1",
+    "nat-api": "^0.3.1",
+    "pidusage": "^4.0.1",
+    "prismarine-nbt": "^2.8.0",
+    "react": "^18.3.0",
+    "sharp": "^0.34.5",
+    "tar": "^7.5.13",
+    "uuid": "^9.0.1",
+    "werift": "^0.22.9"
+  },
+  "devDependencies": {
+    "@types/adm-zip": "^0.5.8",
+    "@types/pidusage": "^2.0.5",
+    "@types/react": "^18.3.0",
+    "@types/tar": "^6.1.13",
+    "@types/uuid": "^9.0.8",
+    "esbuild": "^0.21.5",
+    "pkg": "^5.8.1",
+    "tsx": "^4.15.0",
+    "typescript": "^5.5.0"
+  }
+}
