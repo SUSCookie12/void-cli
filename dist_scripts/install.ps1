@@ -3,7 +3,7 @@
 
 $repo = "SUSCookie12/void-cli"
 $installDir = "$HOME\.void"
-$binName = "void-server-win.exe"
+$binName = "void.exe"
 $url = "https://github.com/$repo/releases/latest/download/void-server-win.exe"
 
 Write-Host "🌑 Initializing Void CLI Installation..." -ForegroundColor Cyan
@@ -13,11 +13,9 @@ if (!(Test-Path $installDir)) {
 }
 
 # Download latest release
-# $url = "https://github.com/$repo/releases/latest/download/void-win.zip"
-# Write-Host "Downloading $url..."
-# Invoke-WebRequest -Uri $url -OutFile "$installDir\void.zip"
-# Expand-Archive -Path "$installDir\void.zip" -DestinationPath $installDir -Force
-# Remove-Item "$installDir\void.zip"
+Write-Host "Downloading Void CLI from GitHub..." -ForegroundColor Yellow
+Invoke-WebRequest -Uri $url -OutFile "$installDir\$binName"
+
 
 Write-Host "✅ Binary installed to $installDir"
 

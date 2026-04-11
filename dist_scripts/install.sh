@@ -19,10 +19,10 @@ fi
 # Create directory
 mkdir -p "$INSTALL_DIR"
 
-# Download latest release (example logic using GitHub API)
-# LATEST_URL=$(curl -s https://api.github.com/repos/$REPO/releases/latest | grep "browser_download_url.*$OS" | cut -d '"' -f 4)
-# curl -L "$LATEST_URL" -o "$INSTALL_DIR/void.tar.gz"
-# tar -xzf "$INSTALL_DIR/void.tar.gz" -C "$INSTALL_DIR"
+# Download latest release
+echo "Downloading Void CLI..."
+curl -L "$BIN_URL" -o "$INSTALL_DIR/$BIN_NAME"
+chmod +x "$INSTALL_DIR/$BIN_NAME"
 
 echo "✅ Binary downloaded to $INSTALL_DIR"
 
