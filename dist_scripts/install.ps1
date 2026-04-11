@@ -1,9 +1,9 @@
 # install.ps1 - Void CLI Windows Installer
-# Usage: iwr https://raw.githubusercontent.com/OWNER/REPO/main/install.ps1 -useb | iex
+# Usage: iwr https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.ps1 -useb | iex
 
 $repo = "SUSCookie12/void-cli"
 $installDir = "$HOME\.void"
-$binName = "void.exe"
+$binName = "voidmc.exe"
 $url = "https://github.com/$repo/releases/latest/download/void-server-win.exe"
 
 Write-Host "🌑 Initializing Void CLI Installation..." -ForegroundColor Cyan
