@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { getServerDir } from '../utils/paths.js';
+import { getPidCpuMemory } from '../utils/pidStats.js';
 import type { ServerMeta } from './manager.js';
 
 export type LogLevel = 'info' | 'warn' | 'error' | 'system' | 'join' | 'leave' | 'command';
@@ -252,9 +253,6 @@ export function subscribeToLogs(
   };
 }
 
-import pidusage from 'pidusage';
-import os from 'os';
-
 export interface ServerStats {
   memory: number; // in bytes
   cpu: number; // percentage
@@ -264,17 +262,13 @@ export interface ServerStats {
 export async function getServerStats(name: string): Promise<ServerStats | null> {
   const inst = instances.get(name);
   if (!inst || !inst.process || inst.process.exitCode !== null || !inst.process.pid) return null;
-  try {
-    const stats = await pidusage(inst.process.pid);
-    const coreCount = os.cpus().length || 1;
-    return {
-      memory: stats.memory,
-      cpu: stats.cpu / coreCount,
-      status: inst.status
-    };
-  } catch (err) {
-    return null;
-  }
+  const row = await getPidCpuMemory(inst.process.pid);
+  if (!row) return null;
+  return {
+    memory: row.memory,
+    cpu: row.cpu,
+    status: inst.status,
+  };
 }
 
 export function getRunningServers(): string[] {

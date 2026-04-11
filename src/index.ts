@@ -1,13 +1,11 @@
 #!/usr/bin/env node
 import { startUI } from './ui/App.js';
 import { initFirebase } from './config/firebase.js';
-
-process.title = 'void-server';
-
-// Initialize Firebase before rendering UI or accessing the DB
-initFirebase();
+import { enforceVoidServerVersionFromRemote } from './config/remoteVersion.js';
 
 import { stopAllServers, setShuttingDown } from './server/instance.js';
+
+process.title = 'void-server';
 
 // Handle graceful shutdown
 const shutdown = async () => {
@@ -25,4 +23,10 @@ const shutdown = async () => {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
-startUI();
+async function main(): Promise<void> {
+  await enforceVoidServerVersionFromRemote();
+  initFirebase();
+  startUI();
+}
+
+void main();

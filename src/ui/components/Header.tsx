@@ -1,6 +1,7 @@
 import React from 'react';
 import { Box, Text } from 'ink';
 import type { UserSession } from '../../auth/session.js';
+import { DAEMON_VERSION } from '../../version.js';
 
 interface HeaderProps {
   session?: UserSession | null;
@@ -31,7 +32,7 @@ export const Header: React.FC<HeaderProps> = ({ session }) => (
     ))}
     <Box>
       <Text color="gray">  SERVER DAEMON </Text>
-      <Text color="cyan" bold>v0.1.0</Text>
+      <Text color="cyan" bold>v{DAEMON_VERSION}</Text>
       {session && (
         <>
           <Text color="gray">  │  </Text>

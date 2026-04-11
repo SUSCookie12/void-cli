@@ -4,6 +4,7 @@ import Spinner from 'ink-spinner';
 import { initFirebase } from '../../config/firebase.js';
 import { startAuthFlow } from '../../auth/auth.js';
 import { getDaemonId, saveSession, type UserSession } from '../../auth/session.js';
+import { DAEMON_VERSION } from '../../version.js';
 
 interface AuthScreenProps {
   onAuthenticated: (session: UserSession) => void;
@@ -74,7 +75,7 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
         ))}
         <Box>
           <Text color="gray">  SERVER DAEMON </Text>
-          <Text color="cyan" bold>v0.1.0</Text>
+          <Text color="cyan" bold>v{DAEMON_VERSION}</Text>
         </Box>
       </Box>
 
