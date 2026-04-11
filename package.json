@@ -6,10 +6,10 @@
   "main": "dist/bundle.cjs",
   "scripts": {
     "dev": "tsx src/index.ts",
-    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --loader:.wasm=file --banner:js=\"import{createRequire}from 'module';import{fileURLToPath}from 'url';import{dirname}from 'path';const require=createRequire(import.meta.url);const __filename=fileURLToPath(import.meta.url);const __dirname=dirname(__filename);\" --outfile=dist/bundle.mjs",
+    "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=esm --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --loader:.wasm=file --banner:js=\"import{createRequire}from 'module';import{fileURLToPath}from 'url';import{dirname}from 'path';const require=createRequire(import.meta.url);const __filename=fileURLToPath(import.meta.url);const __dirname=dirname(__filename);\" --outfile=dist/voidmc.js",
     "postbuild": "node -e \"const fs=require('fs');const path=require('path');const src=path.join('node_modules','yoga-wasm-web','dist','yoga.wasm');const dst=path.join('dist','yoga.wasm');if(fs.existsSync(src)){fs.copyFileSync(src,dst);console.log('Copied yoga.wasm -> dist/yoga.wasm');}\"",
-    "package:win": "pkg dist/bundle.mjs --targets node20-win-x64 --output dist/voidmc.exe --compress GZip --no-bytecode --public",
-    "package:linux": "pkg dist/bundle.mjs --targets node20-linux-x64 --output dist/voidmc-linux --compress GZip --no-bytecode --public",
+    "package:win": "pkg dist/voidmc.js --targets node18-win-x64 --output dist/voidmc.exe --compress GZip --no-bytecode --public",
+    "package:linux": "pkg dist/voidmc.js --targets node18-linux-x64 --output dist/voidmc-linux --compress GZip --no-bytecode --public",
     "package:all": "npm run build && npm run package:win && npm run package:linux"
   },
   "bin": {
@@ -46,7 +46,7 @@
   },
   "pkg": {
     "assets": [
-      "dist/bundle.mjs",
+      "dist/voidmc.js",
       "dist/yoga.wasm"
     ]
   }
