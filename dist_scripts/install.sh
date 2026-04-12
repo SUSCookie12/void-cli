@@ -1,13 +1,14 @@
 #!/bin/bash
 # install.sh - Void CLI Linux/macOS Installer
-# Usage: curl -sSL https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.sh | bash
+# Preferred: curl -fsSL https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.sh | bash
+# Legacy mirror (update when releasing): https://voidmc.cspack.online/install.sh
 
 set -e
 
 REPO="SUSCookie12/void-cli"
 INSTALL_DIR="$HOME/.void"
 BIN_NAME="voidmc"
-VERSION_TAG="v0.1.3"
+VERSION_TAG="v0.1.4"
 BIN_URL_PINNED="https://github.com/${REPO}/releases/download/${VERSION_TAG}/voidmc-linux"
 BIN_URL_LATEST="https://github.com/${REPO}/releases/latest/download/voidmc-linux"
 

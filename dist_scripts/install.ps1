@@ -1,10 +1,11 @@
 # install.ps1 - Void CLI Windows Installer
-# Usage: iwr "https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.ps1" -useb | iex
+# Preferred: iwr "https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.ps1" -useb | iex
+# Legacy mirror: https://voidmc.cspack.online/install.ps1
 
 $repo = "SUSCookie12/void-cli"
 $installDir = "$HOME\.void"
 $binName = "voidmc.exe"
-$versionTag = "v0.1.3"
+$versionTag = "v0.1.4"
 $urlPinned = "https://github.com/$repo/releases/download/$versionTag/$binName"
 $urlLatest = "https://github.com/$repo/releases/latest/download/$binName"
 
