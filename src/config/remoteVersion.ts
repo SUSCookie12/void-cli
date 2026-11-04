@@ -2,7 +2,7 @@ import { DAEMON_VERSION } from '../version.js';
 
 /** Raw JSON from void-versions (must match this shape). */
 export type VoidServerVersionJson = {
-  /** Latest published daemon version, e.g. `"0.1.3"`. */
+  /** Latest published daemon version, e.g. `"0.1.5"`. */
   latestVersion: string;
   /**
    * If `true`, running an older build than `latestVersion` is treated as a hard requirement to update.

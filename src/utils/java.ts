@@ -42,11 +42,16 @@ export function detectJava(versionRequired: number = 17): JavaInfo {
       majorVersion = parseInt(versionString.split('.')[0]);
     }
 
+    // Old Minecraft (needs Java 8) won't run on Java 12+ — class file version too new.
+    // Servers needing Java 17+ tolerate any newer version.
+    const maxSafe = versionRequired <= 11 ? 11 : Infinity;
+    const isCompatible = majorVersion >= versionRequired && majorVersion <= maxSafe;
+
     return {
       found: true,
       version: majorVersion,
       versionString,
-      isCompatible: majorVersion >= versionRequired,
+      isCompatible,
       executablePath: 'java',
     };
   } catch {

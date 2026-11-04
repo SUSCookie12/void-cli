@@ -5,6 +5,7 @@ import TextInput from 'ink-text-input';
 import Spinner from 'ink-spinner';
 import { getVanillaReleases } from '../../api/mojang.js';
 import { getPaperVersions } from '../../api/paper.js';
+import { getFabricGameVersions } from '../../api/fabric.js';
 import { installServer, type InstallProgress } from '../../server/installer.js';
 import {
   isValidServerName,
@@ -13,8 +14,8 @@ import {
   type ServerMeta,
 } from '../../server/manager.js';
 
-type ServerType = 'vanilla' | 'paper';
-type Step = 'type' | 'version' | 'name' | 'ram' | 'confirm' | 'installing' | 'done' | 'error';
+type ServerType = 'vanilla' | 'paper' | 'fabric' | 'forge' | 'purpur' | 'neoforge' | 'quilt';
+type Step = 'type' | 'version' | 'name' | 'port' | 'ram' | 'confirm' | 'installing' | 'done' | 'error';
 
 const STEPS: Step[] = ['type', 'version', 'name', 'port', 'ram', 'confirm', 'installing', 'done'];
 
@@ -31,6 +32,19 @@ interface Props {
   onDone: () => void;
   onBack: () => void;
 }
+
+const displayName = (type: string): string => {
+  const names: Record<string, string> = {
+    paper: 'Paper MC',
+    vanilla: 'Vanilla',
+    fabric: 'Fabric',
+    forge: 'Forge',
+    purpur: 'Purpur',
+    neoforge: 'NeoForge',
+    quilt: 'Quilt',
+  };
+  return names[type] || type;
+};
 
 const Indicator: React.FC<{ isSelected?: boolean }> = ({ isSelected }) => (
   <Text color={isSelected ? 'cyan' : 'gray'}>{isSelected ? '❯ ' : '  '}</Text>
@@ -72,9 +86,26 @@ export const CreateServerScreen: React.FC<Props> = ({ onDone, onBack }) => {
       if (type === 'vanilla') {
         const releases = await getVanillaReleases();
         setVersions(releases.slice(0, 25).map(v => v.id));
-      } else {
-        const v = await getPaperVersions();
+      } else if (type === 'paper' || type === 'purpur') {
+        const { getPurpurVersions } = await import('../../api/purpur.js');
+        const { getPaperVersions } = await import('../../api/paper.js');
+        const v = type === 'purpur' ? await getPurpurVersions() : await getPaperVersions();
         setVersions(v.slice(0, 25));
+      } else if (type === 'fabric') {
+        const v = await getFabricGameVersions(25);
+        setVersions(v);
+      } else if (type === 'forge') {
+        const { getForgeGameVersions } = await import('../../api/forge.js');
+        const v = await getForgeGameVersions(25);
+        setVersions(v);
+      } else if (type === 'neoforge') {
+        const { getNeoForgeGameVersions } = await import('../../api/neoforge.js');
+        const v = await getNeoForgeGameVersions(25);
+        setVersions(v);
+      } else if (type === 'quilt') {
+        const { getQuiltGameVersions } = await import('../../api/quilt.js');
+        const v = await getQuiltGameVersions(25);
+        setVersions(v);
       }
     } catch (err) {
       setError(`Failed to load versions: ${err instanceof Error ? err.message : String(err)}`);
@@ -114,10 +145,11 @@ export const CreateServerScreen: React.FC<Props> = ({ onDone, onBack }) => {
 
   const handleInstall = async () => {
     setStep('installing');
+    const cleanVersion = selectedVersion;
     const meta: ServerMeta = {
       name: serverName,
       type: serverType,
-      version: selectedVersion,
+      version: cleanVersion,
       ram: selectedRam,
       port,
       createdAt: new Date().toISOString(),
@@ -173,6 +205,11 @@ export const CreateServerScreen: React.FC<Props> = ({ onDone, onBack }) => {
             items={[
               { label: '  Paper MC   (Recommended — better performance, plugin support)', value: 'paper' },
               { label: '  Vanilla    (Official Mojang server — no plugins)', value: 'vanilla' },
+              { label: '  Fabric     (Mod loader — add Fabric mods in /mods)', value: 'fabric' },
+              { label: '  Forge      (Mod loader — add Forge mods in /mods)', value: 'forge' },
+              { label: '  Purpur     (Paper fork — enhanced features, plugin support)', value: 'purpur' },
+              { label: '  NeoForge   (Next-gen Forge — mod loader)', value: 'neoforge' },
+              { label: '  Quilt      (Fabric fork — modern mod loader)', value: 'quilt' },
             ]}
             onSelect={item => {
               setServerType(item.value as ServerType);
@@ -266,7 +303,12 @@ export const CreateServerScreen: React.FC<Props> = ({ onDone, onBack }) => {
           <Text color="white" bold> Confirm server details:</Text>
           <Box flexDirection="column" borderStyle="single" borderColor="gray" paddingX={2} paddingY={1}>
             <Box><Text color="gray">  Name:    </Text><Text color="cyan" bold>{serverName}</Text></Box>
-            <Box><Text color="gray">  Type:    </Text><Text color="white">{serverType === 'paper' ? 'Paper MC' : 'Vanilla'}</Text></Box>
+            <Box>
+              <Text color="gray">  Type:    </Text>
+              <Text color="white">
+                {displayName(serverType)}
+              </Text>
+            </Box>
             <Box><Text color="gray">  Version: </Text><Text color="white">{selectedVersion}</Text></Box>
             <Box><Text color="gray">  RAM:     </Text><Text color="white">{selectedRam}</Text></Box>
             <Box><Text color="gray">  Port:    </Text><Text color="white">:{port}</Text></Box>

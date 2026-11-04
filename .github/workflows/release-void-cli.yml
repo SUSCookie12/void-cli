@@ -1,0 +1,44 @@
+# Build voidmc (Windows .exe + Linux binary) and attach them to a GitHub Release.
+#
+# How to ship v0.1.6:
+#   1. Commit version bumps (package.json, src/version.ts, dist_scripts/*).
+#   2. Tag from the repo root:  git tag v0.1.6 && git push origin v0.1.6
+#   3. This workflow runs on tag push v0.* and uploads dist/voidmc.exe + dist/voidmc-linux
+#      to the release for that tag.
+
+name: Release Void CLI
+
+on:
+  push:
+    tags:
+      - 'v0.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Install dependencies and package voidmc
+        working-directory: .
+        run: |
+          npm ci
+          npm run package:all
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/voidmc.exe
+            dist/voidmc-linux
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

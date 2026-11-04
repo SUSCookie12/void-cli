@@ -12,9 +12,20 @@ interface VersionManifest {
   versions: MinecraftVersion[];
 }
 
+async function mojangFetch(url: string): Promise<Response> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 15000);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    if (!res.ok) throw new Error(`HTTP ${res.status}: ${res.statusText}`);
+    return res;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 export async function getVersionManifest(): Promise<VersionManifest> {
-  const res = await fetch(MANIFEST_URL);
-  if (!res.ok) throw new Error(`Mojang API error: ${res.status}`);
+  const res = await mojangFetch(MANIFEST_URL);
   return res.json() as Promise<VersionManifest>;
 }
 
@@ -23,12 +34,17 @@ export async function getVanillaReleases(): Promise<MinecraftVersion[]> {
   return manifest.versions.filter(v => v.type === 'release');
 }
 
+export async function getVanillaAllVersions(max = 50): Promise<string[]> {
+  const manifest = await getVersionManifest();
+  return manifest.versions.map(v => v.id).slice(0, max);
+}
+
 export async function getVanillaServerUrl(versionId: string): Promise<string> {
   const manifest = await getVersionManifest();
   const version = manifest.versions.find(v => v.id === versionId);
   if (!version) throw new Error(`Version ${versionId} not found`);
 
-  const versionData = (await fetch(version.url).then(r => r.json())) as {
+  const versionData = (await (await mojangFetch(version.url)).json()) as {
     downloads?: { server?: { url: string } };
   };
 

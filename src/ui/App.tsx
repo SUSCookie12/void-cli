@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useLayoutEffect } from 'react';
 import { render } from 'ink';
 import { AuthScreen } from './screens/AuthScreen.js';
 import { HomeScreen } from './screens/HomeScreen.js';
@@ -7,6 +7,7 @@ import { ServerDetailScreen } from './screens/ServerDetailScreen.js';
 import { loadSession, clearSession, type UserSession } from '../auth/session.js';
 import { getServerMeta } from '../server/manager.js';
 import { initWebRTCSignaling } from '../network/webrtc.js';
+import { registerSessionRevokedHandler } from '../auth/sessionEvents.js';
 
 type View = 'auth' | 'home' | 'create' | 'server';
 
@@ -14,6 +15,15 @@ const VoidApp: React.FC = () => {
   const [session, setSession] = useState<UserSession | null>(() => loadSession());
   const [view, setView] = useState<View>(() => (loadSession() ? 'home' : 'auth'));
   const [selectedServer, setSelectedServer] = useState<string | null>(null);
+
+  useLayoutEffect(() => {
+    registerSessionRevokedHandler(() => {
+      setSession(null);
+      setView('auth');
+      setSelectedServer(null);
+    });
+    return () => registerSessionRevokedHandler(null);
+  }, []);
 
   useEffect(() => {
     if (session && session.uid && session.daemonId) {

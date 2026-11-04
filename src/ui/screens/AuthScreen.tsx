@@ -1,10 +1,11 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import { Box, Text } from 'ink';
 import Spinner from 'ink-spinner';
 import { initFirebase } from '../../config/firebase.js';
 import { startAuthFlow } from '../../auth/auth.js';
 import { getDaemonId, saveSession, type UserSession } from '../../auth/session.js';
 import { DAEMON_VERSION } from '../../version.js';
+import qrcode from 'qrcode-terminal';
 
 interface AuthScreenProps {
   onAuthenticated: (session: UserSession) => void;
@@ -26,6 +27,29 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
   const [authUrl, setAuthUrl] = useState('');
   const [sessionId, setSessionId] = useState('');
   const [error, setError] = useState('');
+  const [qrLines, setQrLines] = useState<string[]>([]);
+
+  const shouldRenderQr = useMemo(() => {
+    // Only render QR when we have a real URL and the output is interactive.
+    if (!authUrl) return false;
+    return Boolean(process.stdout.isTTY);
+  }, [authUrl]);
+
+  useEffect(() => {
+    if (!shouldRenderQr) {
+      setQrLines([]);
+      return;
+    }
+
+    try {
+      // qrcode-terminal calls the callback with a pre-rendered multi-line string.
+      qrcode.generate(authUrl, { small: true }, (qr: string) => {
+        setQrLines(qr.split('\n').filter(Boolean));
+      });
+    } catch {
+      setQrLines([]);
+    }
+  }, [authUrl, shouldRenderQr]);
 
   useEffect(() => {
     let cancelled = false;
@@ -94,6 +118,15 @@ export const AuthScreen: React.FC<AuthScreenProps> = ({ onAuthenticated }) => {
             <Text> </Text>
             <Text color="cyan" bold>  {authUrl}</Text>
             <Text> </Text>
+            {qrLines.length > 0 && (
+              <Box flexDirection="column">
+                <Text color="gray" dimColor>Scan on mobile:</Text>
+                {qrLines.map((line, i) => (
+                  <Text key={i}>{line}</Text>
+                ))}
+                <Text> </Text>
+              </Box>
+            )}
             <Text color="gray" dimColor>  Ctrl+Click (Windows/Linux)  or  Cmd+Click (Mac) to open</Text>
           </Box>
           <Box gap={1}>

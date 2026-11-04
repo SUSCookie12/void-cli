@@ -1,8 +1,6 @@
-const path = require('path');
-
 function launch() {
   try {
-    require(path.join(__dirname, 'dist', 'bundle.cjs'));
+    require('./dist/bundle.cjs');
   } catch (err) {
     console.error('[VOID] Fatal Launch Error:');
     console.error(err);

@@ -1,13 +1,21 @@
-import {
-  doc,
-  setDoc,
-  updateDoc,
-  onSnapshot,
-  serverTimestamp,
-} from 'firebase/firestore';
+import { onSnapshot } from 'firebase/firestore';
 import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '../config/firebase.js';
 import { getDaemonId } from './session.js';
+
+const API_KEY = 'AIzaSyAxkQA5tBqp_5fco6Y_8i2mhI15ECJeNh0';
+const FIRESTORE_BASE = 'https://firestore.googleapis.com/v1/projects/cookiemovie-27669/databases/(default)';
+const DOC_BASE = 'projects/cookiemovie-27669/databases/(default)/documents';
+
+async function restCommit(writes: any[]): Promise<void> {
+  try {
+    await fetch(`${FIRESTORE_BASE}/documents:commit?key=${API_KEY}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ writes }),
+    });
+  } catch {}
+}
 
 export interface AuthResult {
   uid: string;
@@ -28,18 +36,24 @@ export async function startAuthFlow(
   const sessionId = generateSessionId();
   const daemonId = getDaemonId();
 
-  // Create the document in the user's existing login_tokens collection
-  await setDoc(doc(db, 'login_tokens', sessionId), {
-    token: '',
-    createdAt: serverTimestamp(),
-    status: 'waiting',
-    source: 'void_server',
-    daemonId,
-    uid: '',
-    email: '',
-  });
+  // Create the login_tokens document via REST API
+  await restCommit([{
+    update: {
+      name: `${DOC_BASE}/login_tokens/${sessionId}`,
+      fields: {
+        token: { stringValue: '' },
+        status: { stringValue: 'pending' },
+        source: { stringValue: 'void_server' },
+        daemonId: { stringValue: daemonId },
+        uid: { stringValue: '' },
+        email: { stringValue: '' },
+        createdAt: { timestampValue: new Date().toISOString() },
+      },
+    },
+  }]);
 
-  const authUrl = `https://cspack.online/request?api=${sessionId}`;
+  const origin = (process.env.VOID_AUTH_HANDOFF_ORIGIN || 'https://void.borgov.dev').replace(/\/$/, '');
+  const authUrl = `${origin}/api?login=${encodeURIComponent(sessionId)}`;
   onLinkGenerated(authUrl, sessionId);
 
   return new Promise<AuthResult>((resolve, reject) => {
@@ -64,9 +78,12 @@ export async function startAuthFlow(
           // Mark as completed (for the user's future dashboard)
           if (data.status !== 'completed') {
             try {
-              await updateDoc(doc(db, 'login_tokens', sessionId), {
-                status: 'completed',
-              });
+              await restCommit([{
+                update: {
+                  name: `${DOC_BASE}/login_tokens/${sessionId}`,
+                  fields: { status: { stringValue: 'completed' } },
+                },
+              }]);
             } catch {
               // Non-critical, continue anyway
             }

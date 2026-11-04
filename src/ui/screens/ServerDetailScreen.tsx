@@ -16,6 +16,7 @@ import {
 import { deleteServer, type ServerMeta } from '../../server/manager.js';
 import type { UserSession } from '../../auth/session.js';
 import { FileExplorerScreen } from './FileExplorerScreen.js';
+import { ShareAccessScreen } from './ShareAccessScreen.js';
 
 interface Props {
   meta: ServerMeta;
@@ -23,7 +24,7 @@ interface Props {
   onBack: () => void;
 }
 
-type Pane = 'actions' | 'console' | 'files';
+type Pane = 'actions' | 'console' | 'files' | 'share';
 
 const LOG_COLOR: Record<string, string> = {
   info: 'white',
@@ -67,6 +68,7 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
   }, [meta.name]);
 
   useInput((input, key) => {
+    if (pane === 'share') return;
     if (key.escape) {
       if (pane === 'console') setPane('actions');
       else onBack();
@@ -74,6 +76,7 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
     if (input === 'c' || input === 'C') setPane('console');
     if (input === 'a' || input === 'A') setPane('actions');
     if (input === 'f' || input === 'F') setPane('files');
+    if (input === 's' || input === 'S') setPane('share');
   });
 
   const sendCmd = useCallback((cmd: string) => {
@@ -102,7 +105,9 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
         <Text bold color="white">{meta.name}</Text>
         <Text color={statusColor} bold>{statusText}</Text>
         <Text color="gray">│</Text>
-        <Text color="gray">{meta.type === 'paper' ? 'Paper' : 'Vanilla'} {meta.version}</Text>
+        <Text color="gray">
+          {meta.type === 'paper' ? 'Paper' : meta.type === 'fabric' ? 'Fabric' : meta.type === 'forge' ? 'Forge' : meta.type === 'purpur' ? 'Purpur' : meta.type === 'neoforge' ? 'NeoForge' : meta.type === 'quilt' ? 'Quilt' : meta.type === 'arclight' ? 'Arclight' : 'Vanilla'} {meta.version}
+        </Text>
         <Text color="gray">│</Text>
         <Text color="gray">RAM: {meta.ram}</Text>
         <Text color="gray">│</Text>
@@ -132,6 +137,13 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
         >
           [F] Files
         </Text>
+        <Text
+          color={pane === 'share' ? 'cyan' : 'gray'}
+          bold={pane === 'share'}
+          underline={pane === 'share'}
+        >
+          [S] Share Access
+        </Text>
         <Text color="gray">  Esc to go back</Text>
       </Box>
 
@@ -149,6 +161,7 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
                   : [{ label: '  ▶ Start Server', value: 'start' }]),
                 { label: '  ⌨  Open Console', value: 'console' },
                 { label: '  📂 File Explorer', value: 'files' },
+                { label: '  🤝 Share Access', value: 'share' },
                 { label: '  ✕ Delete Server', value: 'delete' },
                 { label: '  ← Back', value: 'back' },
               ]}
@@ -164,6 +177,8 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
                   setPane('console');
                 } else if (item.value === 'files') {
                   setPane('files');
+                } else if (item.value === 'share') {
+                  setPane('share');
                 } else if (item.value === 'delete') {
                   setConfirmDelete(true);
                 } else if (item.value === 'back') {
@@ -248,6 +263,15 @@ export const ServerDetailScreen: React.FC<Props> = ({ meta, session, onBack }) =
         <FileExplorerScreen 
           serverName={meta.name}
           onBack={() => setPane('actions')} 
+        />
+      )}
+
+      {/* ── PANE: SHARE ACCESS ── */}
+      {pane === 'share' && (
+        <ShareAccessScreen
+          serverName={meta.name}
+          session={session}
+          onBack={() => setPane('actions')}
         />
       )}
     </Box>

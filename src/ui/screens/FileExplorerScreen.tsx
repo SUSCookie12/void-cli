@@ -156,7 +156,9 @@ export const FileExplorerScreen: React.FC<Props> = ({ serverName, onBack }) => {
     return (
       <Box flexDirection="column" paddingX={2} paddingY={1} borderStyle="single" borderColor="yellow">
         <Text bold color="yellow"> ⚠  Unsaved Changes</Text>
-        <Text color="white" marginTop={1}>You have unsaved changes in "{selectedEntry?.name}". What would you like to do?</Text>
+        <Box marginTop={1}>
+          <Text color="white">You have unsaved changes in "{selectedEntry?.name}". What would you like to do?</Text>
+        </Box>
         <Box marginTop={1}>
           <SelectInput 
             items={[
@@ -193,7 +195,9 @@ export const FileExplorerScreen: React.FC<Props> = ({ serverName, onBack }) => {
           <Text color="cyan">❯ </Text>
           <TextInput value={inputText} onChange={setInputText} onSubmit={handleInputSubmit} />
         </Box>
-        <Text color="gray" marginTop={1}>Press Enter to confirm, Esc to cancel</Text>
+        <Box marginTop={1}>
+          <Text color="gray">Press Enter to confirm, Esc to cancel</Text>
+        </Box>
       </Box>
     );
   }

@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { getServerDir } from './paths.js';
+import { moveToTrash } from './trash.js';
 
 export interface FileEntry {
   name: string;
@@ -11,7 +12,7 @@ export interface FileEntry {
 }
 
 const EDITABLE_EXTENSIONS = new Set([
-  '.properties', '.yml', '.yaml', '.json', '.txt', '.log', '.sh', '.bat', '.cmd', '.cfg', '.conf'
+  '.properties', '.yml', '.yaml', '.json', '.txt', '.log', '.sh', '.bat', '.cmd', '.cfg', '.conf', '.toml', '.ini', '.mcmeta', '.md', '.json5'
 ]);
 
 const HIDDEN_FILES = new Set([
@@ -83,9 +84,13 @@ export function writeTextFile(serverName: string, filePath: string, content: str
   fs.writeFileSync(safePath, content, 'utf8');
 }
 
-export function deleteEntry(serverName: string, targetPath: string): void {
-  const safePath = getSafePath(serverName, targetPath);
-  fs.rmSync(safePath, { recursive: true, force: true });
+export function deleteEntry(serverName: string, targetPath: string, permanent: boolean = false): void {
+  if (permanent) {
+    const safePath = getSafePath(serverName, targetPath);
+    fs.rmSync(safePath, { recursive: true, force: true });
+  } else {
+    moveToTrash(serverName, targetPath);
+  }
 }
 
 export function createEntry(serverName: string, targetPath: string, isFolder: boolean): void {

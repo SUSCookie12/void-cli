@@ -2,16 +2,32 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { getServersDir, getServerDir } from '../utils/paths.js';
 
+export type JvmPreset = 'standard' | 'aikar' | 'shenandoah' | 'zgc' | 'low_ram' | 'custom';
+
 export interface ServerMeta {
   name: string;
-  type: 'vanilla' | 'paper';
+  type: 'vanilla' | 'paper' | 'fabric' | 'forge' | 'purpur' | 'neoforge' | 'quilt' | 'arclight';
   version: string;
   build?: number;
+  fabricLoader?: string;
+  forgeVersion?: string;
+  neoforgeVersion?: string;
+  launchJar?: string;
   ram: string;
   port: number;
   createdAt: string;
   autoExpose?: boolean;
   subdomain?: string;
+  statusId?: string;
+  localIp?: string;
+  statusPageShowIp?: boolean;
+  statusPageTheme?: string;
+  statusPageDescription?: string;
+  javaVersion?: number;
+  customJavaPath?: string;
+  jvmPreset?: JvmPreset;
+  customJvmArgs?: string;
+  initialProperties?: Record<string, string>;
 }
 
 export function listServers(): ServerMeta[] {

@@ -473,13 +473,117 @@ const DIM_PATHS: Record<string, string[]> = {
   ],
 };
 
-function getActiveDimDir(serverDir: string, dim: string): string | null {
-  const paths = DIM_PATHS[dim] || [];
-  for (const p of paths) {
+const CRC_TABLE = new Uint32Array(256);
+for (let n = 0; n < 256; n++) {
+  let c = n;
+  for (let k = 0; k < 8; k++) {
+    c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+  }
+  CRC_TABLE[n] = c >>> 0;
+}
+
+function crc32(buf: Buffer): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function makePngChunk(type: string, data: Buffer): Buffer {
+  const len = Buffer.alloc(4);
+  len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcInput = Buffer.concat([typeBuf, data]);
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(crcInput), 0);
+  return Buffer.concat([len, typeBuf, data, crc]);
+}
+
+export function encodeRgbaToPng(rgba: Uint8Array, width: number, height: number): Buffer {
+  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; // bit depth
+  ihdr[9] = 6; // color type RGBA
+  ihdr[10] = 0;
+  ihdr[11] = 0;
+  ihdr[12] = 0;
+
+  const rowStride = width * 4;
+  const raw = Buffer.alloc(height * (1 + rowStride));
+  for (let y = 0; y < height; y++) {
+    const rowStart = y * (1 + rowStride);
+    raw[rowStart] = 0; // Filter type 0 (None)
+    Buffer.from(rgba.buffer, rgba.byteOffset + y * rowStride, rowStride).copy(raw, rowStart + 1);
+  }
+
+  const idatData = zlib.deflateSync(raw, { level: 6 });
+  return Buffer.concat([
+    signature,
+    makePngChunk('IHDR', ihdr),
+    makePngChunk('IDAT', idatData),
+    makePngChunk('IEND', Buffer.alloc(0)),
+  ]);
+}
+
+function getLevelNameFromDir(serverDir: string): string {
+  try {
+    const propsPath = path.join(serverDir, 'server.properties');
+    if (fs.existsSync(propsPath)) {
+      const content = fs.readFileSync(propsPath, 'utf-8');
+      for (const line of content.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('level-name=')) {
+          const val = trimmed.slice('level-name='.length).trim();
+          if (val) return val;
+        }
+      }
+    }
+  } catch {}
+  return 'world';
+}
+
+function resolveRegionDir(serverDir: string, dim: string): string | null {
+  const levelName = getLevelNameFromDir(serverDir);
+  const candidates: string[] = [];
+
+  if (dim === 'overworld') {
+    candidates.push(
+      path.join(levelName, 'region'),
+      path.join(levelName, 'dimensions', 'minecraft', 'overworld', 'region'),
+      ...(DIM_PATHS.overworld || []),
+    );
+  } else if (dim === 'nether') {
+    candidates.push(
+      path.join(levelName, 'DIM-1', 'region'),
+      path.join(`${levelName}_nether`, 'DIM-1', 'region'),
+      path.join(`${levelName}_nether`, 'region'),
+      path.join(levelName, 'dimensions', 'minecraft', 'the_nether', 'region'),
+      ...(DIM_PATHS.nether || []),
+      path.join('dimensions', 'minecraft', 'the_nether', 'region'),
+    );
+  } else if (dim === 'end' || dim === 'the_end') {
+    candidates.push(
+      path.join(levelName, 'DIM1', 'region'),
+      path.join(`${levelName}_the_end`, 'DIM1', 'region'),
+      path.join(`${levelName}_the_end`, 'region'),
+      path.join(levelName, 'dimensions', 'minecraft', 'the_end', 'region'),
+      ...(DIM_PATHS.end || []),
+      path.join('dimensions', 'minecraft', 'the_end', 'region'),
+    );
+  }
+
+  for (const p of candidates) {
     const full = path.join(serverDir, p);
     if (fs.existsSync(full)) return full;
   }
   return null;
+}
+
+function getActiveDimDir(serverDir: string, dim: string): string | null {
+  return resolveRegionDir(serverDir, dim);
 }
 
 async function processQueue(): Promise<void> {
@@ -508,10 +612,7 @@ async function processQueue(): Promise<void> {
         fs.unlinkSync(tmp);
 
         if (pixelData) {
-          const sharp = (await import('sharp')).default;
-          const png   = await sharp(pixelData, { raw: { width: 512, height: 512, channels: 4 } })
-            .png({ compressionLevel: 6 })
-            .toBuffer();
+          const png = encodeRgbaToPng(pixelData, 512, 512);
           
           tileCache.set(key, png);
           console.log(`[WorldMap] Rendered tile ${key} (${(png.length / 1024).toFixed(1)} KB)`);
@@ -603,7 +704,7 @@ export function getMapMetadata(serverName: string) {
 
 export async function getMapTile(serverName: string, dim: string, rx: number, rz: number, maxY?: number, intensity?: number): Promise<Buffer | null> {
   const filename = `r.${rx}.${rz}.mca`;
-  const cacheKey = `${serverName}:${dim}:${filename}${maxY !== undefined ? ':' + maxY : ''}${intensity !== undefined ? ':i' + intensity : ''}`;
+  const cacheKey = `${serverName}:${dim}:${filename}${maxY !== undefined ? ':' + maxY : ':auto'}${intensity !== undefined ? ':i' + intensity : ''}`;
   
   if (tileCache.has(cacheKey)) return tileCache.get(cacheKey)!;
 

@@ -118,7 +118,7 @@ export async function startExpose(
         activeExposures.set(serverName, { strategy: 'upnp', subdomain, port: serverPort, address: addr });
         onEvent({ type: 'tunnel_active', payload: { address: addr, strategy: 'upnp' } });
         return;
-      } catch {}
+      } catch (e) { console.warn("[swallowed error in tunnelManager.ts]:", e); }
     }
   }
 
@@ -178,7 +178,7 @@ export async function startExpose(
         try {
           const publicAddress = await registerTunnelDns(subdomain, pHost, pPort);
           onEvent({ type: 'tunnel_active', payload: { address: publicAddress, strategy: 'playit' } });
-        } catch {}
+        } catch (e) { console.warn("[swallowed error in tunnelManager.ts]:", e); }
       }
     });
     proc.on('exit', () => activeExposures.delete(serverName));
