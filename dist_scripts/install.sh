@@ -1,7 +1,6 @@
 #!/bin/bash
 # install.sh - Void CLI Linux/macOS Installer
-# Preferred: curl -fsSL https://raw.githubusercontent.com/SUSCookie12/void-cli/main/dist_scripts/install.sh | bash
-# Legacy mirror (update when releasing): https://voidmc.cspack.online/install.sh
+# Preferred: curl -fsSL https://get.void.borgov.dev/install.sh | bash
 
 set -e
 
@@ -23,9 +22,35 @@ fi
 mkdir -p "$INSTALL_DIR"
 
 echo "Downloading Void CLI..."
-if ! curl -fSL "$BIN_URL_PINNED" -o "$INSTALL_DIR/$BIN_NAME" 2>/dev/null; then
+
+# Use HTTP/1.1 and retry to prevent HTTP/2 PROTOCOL_ERROR (err 1) on large GitHub/Azure assets
+download_binary() {
+    local url="$1"
+    local dest="$2"
+
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fSL --http1.1 --retry 3 --retry-delay 2 "$url" -o "$dest"; then
+            return 0
+        fi
+    fi
+
+    if command -v wget >/dev/null 2>&1; then
+        echo "Retrying download with wget..."
+        if wget -q --show-progress -O "$dest" "$url"; then
+            return 0
+        fi
+    fi
+
+    return 1
+}
+
+if ! download_binary "$BIN_URL_PINNED" "$INSTALL_DIR/$BIN_NAME"; then
     echo "Warning: Could not download ${VERSION_TAG}, trying latest release..."
-    curl -fSL "$BIN_URL_LATEST" -o "$INSTALL_DIR/$BIN_NAME"
+    if ! download_binary "$BIN_URL_LATEST" "$INSTALL_DIR/$BIN_NAME"; then
+        echo "❌ Download failed. Please check your network connection or download manually from:"
+        echo "   $BIN_URL_PINNED"
+        exit 1
+    fi
 fi
 
 chmod +x "$INSTALL_DIR/$BIN_NAME"
