@@ -31,7 +31,7 @@ jobs:
       - name: Install dependencies and package voidmc
         working-directory: .
         run: |
-          npm ci
+          npm install
           npm run package:all
 
       - name: Publish GitHub Release assets
