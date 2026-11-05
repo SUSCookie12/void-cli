@@ -6,6 +6,7 @@ import { getServerDir } from '../utils/paths.js';
 import { getPidCpuMemory } from '../utils/pidStats.js';
 import type { ServerMeta } from './manager.js';
 import { analyzeLogs, getLatestCrashReport, type CrashAnalysis } from './crashAnalyzer.js';
+import { getRequiredJava, detectJava, installJava } from '../utils/java.js';
 
 export function listServerJarsInDir(cwd: string): string[] {
   if (!fs.existsSync(cwd)) return [];
@@ -309,7 +310,7 @@ export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => vo
   console.log(`[DEBUG] Handling start_server for ${meta.name} (version: ${meta.version})`);
 
   try {
-    const { getRequiredJava, detectJava, installJava } = await import('../utils/java.js');
+
     console.log(`[DEBUG] Java utilities imported`);
     
     let javaExecutable = 'java';

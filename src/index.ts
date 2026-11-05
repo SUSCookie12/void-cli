@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
+import fs from 'node:fs';
+import path from 'node:path';
 import { createInterface } from 'node:readline';
+// @ts-ignore
+import * as archiverModule from 'archiver';
 import { startUI } from './ui/App.js';
 import { initFirebase } from './config/firebase.js';
 import { enforceVoidServerVersionFromRemote } from './config/remoteVersion.js';
@@ -15,15 +19,12 @@ if (!isMainThread) {
   const runWorkerTask = async () => {
     try {
       const { task, data } = workerData || {};
-      const archiverModule = await import('archiver');
-      const archiver = (archiverModule as any).default || archiverModule;
-      const fs = await import('node:fs');
-      const path = await import('node:path');
+      const archiverFn = (archiverModule as any)?.default || archiverModule;
 
       if (task === 'zipFolder') {
         const { sourceFolder, destZipPath } = data;
         const output = fs.createWriteStream(destZipPath);
-        const archive = archiver('zip', {
+        const archive = archiverFn('zip', {
           zlib: { level: 6 },
           forceZip64: true,
         });
@@ -55,7 +56,7 @@ if (!isMainThread) {
       } else if (task === 'zipSelection') {
         const { rootDir, selections, destZipPath } = data;
         const output = fs.createWriteStream(destZipPath);
-        const archive = archiver('zip', {
+        const archive = archiverFn('zip', {
           zlib: { level: 6 },
           forceZip64: true,
         });

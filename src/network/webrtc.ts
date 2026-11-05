@@ -1,5 +1,5 @@
 import { RTCPeerConnection, RTCSessionDescription } from 'werift';
-import { collection, query, where, onSnapshot, doc } from 'firebase/firestore';
+import { collection, query, where, onSnapshot, doc, getDoc } from 'firebase/firestore';
 import { getDb } from '../config/firebase.js';
 import {
   subscribeToLogs,
@@ -17,9 +17,10 @@ import {
   isEulaAccepted,
   subscribeToCrash,
   getServerLogsText,
-  getLatestCrash
+  getLatestCrash,
+  waitForServerStop
 } from '../server/instance.js';
-import { listServers, deleteServer, renameServer, getNextAvailablePort, getServerMeta, saveServerMeta } from '../server/manager.js';
+import { listServers, deleteServer, renameServer, getNextAvailablePort, getServerMeta, saveServerMeta, serverExists, isValidServerName } from '../server/manager.js';
 import { installServer, importServerFromSource, inspectServerDirectory } from '../server/installer.js';
 import { listServerJarsInDir, resolveServerJarName } from '../server/instance.js';
 import { readProperties, writeProperties } from '../server/properties.js';
@@ -52,20 +53,32 @@ import {
   setTrashRetentionDays,
   pruneExpiredTrash 
 } from '../utils/trash.js';
-import { getServerDir } from '../utils/paths.js';
+import { getServerDir, getLocalBackupsDir } from '../utils/paths.js';
 import { getRunningServers } from '../server/instance.js';
 import { DAEMON_VERSION } from '../version.js';
 import { startExpose, stopExpose, getTunnelState } from './tunnelManager.js';
 import { isValidSubdomain } from './dnsManager.js';
 import { getArclightVersions } from '../api/arclight.js';
+import { getVanillaReleases } from '../api/mojang.js';
+import { getPaperVersions } from '../api/paper.js';
+import { getFabricGameVersions } from '../api/fabric.js';
+import { getForgeGameVersions } from '../api/forge.js';
+import { getPurpurVersions } from '../api/purpur.js';
+import { getNeoForgeGameVersions } from '../api/neoforge.js';
+import { getQuiltGameVersions } from '../api/quilt.js';
+import net from 'node:net';
+import https from 'node:https';
+import { execSync } from 'node:child_process';
+import AdmZip from 'adm-zip';
+import { getPublicIp } from './portForwarding.js';
+import { startMapWatcher, stopMapWatcher, getMapMetadata, getMapTile, refreshAllTiles } from '../utils/worldMap.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { v4 as uuidv4 } from 'uuid';
-import { clearSession } from '../auth/session.js';
+import { clearSession, getDaemonId, loadBackupConfig, saveBackupConfig, loadLocalBackupLimit, saveLocalBackupLimit } from '../auth/session.js';
 import { notifySessionRevoked } from '../auth/sessionEvents.js';
 import { getHostCpuPercent, getHostMemoryStats } from '../utils/hostStats.js';
-import { logDaemonActivity } from '../utils/activityLogger.js';
 
 const PROJECT = 'cookiemovie-27669';
 const DB = '(default)';
@@ -324,7 +337,6 @@ async function performUpdateCli() {
 
   console.log(`[Update] Running install command for ${plat}...`);
   try {
-    const { execSync } = await import('node:child_process');
     execSync(installCmd, { stdio: 'inherit', timeout: 120_000 });
     console.log('[Update] CLI updated successfully. Exiting...');
   } catch (e: any) {
@@ -428,358 +440,246 @@ export function initWebRTCSignaling(uid: string, daemonId: string): () => void {
     notifySessionRevoked();
   });
 
-  const inFlightOffers = new Set<string>();
-
-  const handleIncomingOffer = async (docId: string, data: any) => {
-    if (inFlightOffers.has(docId)) return;
-    inFlightOffers.add(docId);
-
-    try {
-      // 1. Filter out stale offers (older than 45 seconds) to avoid hanging on abandoned client sessions
-      const offerTime = data.createdAt ? new Date(data.createdAt).getTime() : Number(docId.split('_').pop());
-      const isStale = offerTime > 0 && !isNaN(offerTime) && (Date.now() - offerTime > 45000);
-      if (isStale) {
-        console.log(`[WebRTC] Skipping stale offer ${docId} (created ${Math.round((Date.now() - offerTime) / 1000)}s ago)`);
-        try {
-          await restCommit([{
-            update: {
-              name: docName(`daemon_connections/${docId}`),
-              fields: { status: { stringValue: 'stale' } },
-            },
-          }]);
-        } catch {}
-        return;
+  unsubConnections = onSnapshot(q, async (snapshot) => {
+    // #region agent log
+    __agentDebugLog(
+      'run2',
+      'H1',
+      'void_server/src/network/webrtc.ts:onSnapshot-offers',
+      'Offer snapshot update',
+      {
+        daemonId,
+        changes: snapshot.docChanges().map(c => ({
+          type: c.type,
+          id: c.doc.id,
+          status: c.doc.data()?.status
+        }))
       }
+    );
+    // #endregion
+    for (const change of snapshot.docChanges()) {
+      if (change.type === 'added') {
+        const data = change.doc.data();
+        const docId = change.doc.id;
 
-      let offerData: any;
-      if (typeof data.offer === 'string') {
-        offerData = JSON.parse(data.offer);
-      } else if (typeof data.offer?.toJSON === 'function') {
-        offerData = data.offer.toJSON();
-      } else {
-        offerData = JSON.parse(JSON.stringify(data.offer || {}));
-      }
-
-      if (!offerData?.sdp || !offerData?.type) {
-        console.error(`[WebRTC] Invalid offer ${docId} - missing sdp/type`);
-        try {
-          await restCommit([{
-            update: {
-              name: docName(`daemon_connections/${docId}`),
-              fields: { status: { stringValue: 'invalid' } },
-            },
-          }]);
-        } catch {}
-        return;
-      }
-
-      // #region agent log
-      __agentDebugLog(
-        'run2',
-        'H2',
-        'void_server/src/network/webrtc.ts:received-offer',
-        'Received matching offer',
-        {
-          daemonId,
-          docId,
-          offerType: offerData?.type,
-        }
-      );
-      // #endregion
-      console.log(`[WebRTC] Received offer for node ${daemonId} from ${docId}`);
-      const peerUserId = String(data.userId || data.clientUid || uid);
-      if (peerUserId !== currentOwnerUid) {
-        await refreshServerAccessGrants();
-      }
-
-      const pc = new RTCPeerConnection({
-        iceServers: [
-          { urls: 'stun:stun.l.google.com:19302' },
-          { urls: 'stun:stun1.l.google.com:19302' },
-          { urls: 'stun:stun.cloudflare.com:3478' },
-        ],
-      });
-
-      pc.onDataChannel.subscribe((channel) => {
-        channelUserMap.set(channel, peerUserId);
-        // #region agent log
-        __agentDebugLog(
-          'run2',
-          'H3',
-          'void_server/src/network/webrtc.ts:onDataChannel',
-          'DataChannel opened',
-          {
-            daemonId,
-            label: channel.label,
-            readyState: channel.readyState,
-          }
-        );
-        // #endregion
-        console.log(`[WebRTC] DataChannel ${channel.label} opened`);
-
-        if (channel.label.startsWith('tunnel::')) {
-          const parts = channel.label.split('::');
-          const serverName = parts[1];
-          const connId = parts[2];
-
-          const targetServer = listServers().find((s) => s.name === serverName);
-          if (!targetServer || !isRunning(serverName)) {
-            console.log(`[WebRTC Tunnel] Server ${serverName} not running, rejecting tunnel.`);
-            channel.close();
-            return;
-          }
-
-          import('node:net').then((net) => {
-            const tcpSocket = new net.Socket();
-            tcpSocket.connect(targetServer.port, '127.0.0.1', () => {
-              console.log(`[WebRTC Tunnel] Connected TCP proxy for ${serverName}:${targetServer.port} [${connId}]`);
-            });
-
-            tcpSocket.on('data', (sockData) => {
-              if (channel.readyState === 'open') {
-                channel.send(sockData);
-              }
-            });
-
-            channel.onMessage.subscribe((msgBuf) => {
-              if (msgBuf instanceof Buffer) {
-                tcpSocket.write(msgBuf);
-              }
-            });
-
-            const cleanup = () => {
-              tcpSocket.destroy();
-              if (channel.readyState !== 'closed') channel.close();
-            };
-
-            tcpSocket.on('close', cleanup);
-            tcpSocket.on('error', (err) => {
-              console.error(`[WebRTC Tunnel] TCP Error on ${connId}:`, err);
-              cleanup();
-            });
-          });
-          return;
-        }
-
-        openChannels.add(channel);
-
-        const activeTransfers = new Map<
-          string,
-          {
-            writeStream?: fs.WriteStream;
-            path: string;
-            size: number;
-            received: number;
-          }
-        >();
-
-        let statsInterval: NodeJS.Timeout | undefined;
-        let unsubStatus: (() => void) | undefined;
-        let unsubCrash: (() => void) | undefined;
-
-        const cleanupChannel = () => {
-          openChannels.delete(channel);
-          if (statsInterval) {
-            clearInterval(statsInterval);
-            statsInterval = undefined;
-          }
-          if (unsubStatus) {
-            unsubStatus();
-            unsubStatus = undefined;
-          }
-          if (unsubCrash) {
-            unsubCrash();
-            unsubCrash = undefined;
-          }
-        };
-
-        channel.stateChanged.subscribe(() => {
-          if (channel.readyState !== 'open') {
-            cleanupChannel();
-          }
-        });
-
-        statsInterval = setInterval(async () => {
-          if (channel.readyState === 'open') {
-            const peerUid = channelUserMap.get(channel) || currentOwnerUid;
-            const servers = listServers();
-            const statsMap: Record<string, any> = {};
-            for (const s of servers) {
-              if (peerUid !== currentOwnerUid && !getPeerGrant(peerUid, s.name)) continue;
-              if (isRunning(s.name)) {
-                const stats = await getServerStats(s.name);
-                if (stats) statsMap[s.name] = stats;
-              }
+        if (data.offer && data.status === 'offer') {
+          // #region agent log
+          __agentDebugLog(
+            'run2',
+            'H2',
+            'void_server/src/network/webrtc.ts:received-offer',
+            'Received matching offer',
+            {
+              daemonId,
+              docId,
+              offerType: data.offer?.type
             }
-            channel.send(JSON.stringify({ type: 'stats_update', stats: statsMap }));
-          } else {
-            cleanupChannel();
+          );
+          // #endregion
+          console.log(`[WebRTC] Received offer for node ${daemonId} from ${docId}`);
+          const peerUserId = String(data.userId || data.clientUid || uid);
+          if (peerUserId !== currentOwnerUid) {
+            await refreshServerAccessGrants();
           }
-        }, 2000);
-
-        unsubStatus = subscribeToAllStatus(() => {
-          if (channel.readyState === 'open') {
-            void sendServersList(channel);
-          } else {
-            cleanupChannel();
-          }
-        });
-
-        unsubCrash = subscribeToCrash((name, analysis) => {
-          if (channel.readyState === 'open') {
-            const peerUid = channelUserMap.get(channel) || currentOwnerUid;
-            if (peerUid === currentOwnerUid || hasServerPerm(peerUid, name, 'canDiagnostics')) {
-              channel.send(
-                JSON.stringify({
-                  type: 'crash_detected',
-                  server: name,
-                  analysis,
-                })
-              );
-            }
-          } else {
-            cleanupChannel();
-          }
-        });
-
-        channel.onMessage.subscribe(async (msgBuf) => {
-          const text = typeof msgBuf === 'string' ? msgBuf : Buffer.from(msgBuf).toString('utf-8');
-          logDaemonActivity('webrtc', `[WebRTC onMessage] ${text?.slice(0, 120)}`);
           try {
-            if (text && (text.startsWith('{') || text.startsWith('['))) {
-              JSON.parse(text);
-              handleClientMessage(channel, text, activeTransfers);
+            const pc = new RTCPeerConnection({
+              iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+            });
+
+            pc.onDataChannel.subscribe((channel) => {
+              channelUserMap.set(channel, peerUserId);
+              // #region agent log
+              __agentDebugLog(
+                'run2',
+                'H3',
+                'void_server/src/network/webrtc.ts:onDataChannel',
+                'DataChannel opened',
+                {
+                  daemonId,
+                  label: channel.label,
+                  readyState: channel.readyState
+                }
+              );
+              // #endregion
+              console.log(`[WebRTC] DataChannel ${channel.label} opened`);
+              
+              if (channel.label.startsWith('tunnel::')) {
+                const parts = channel.label.split('::');
+                const serverName = parts[1];
+                const connId = parts[2];
+                
+                const targetServer = listServers().find(s => s.name === serverName);
+                if (!targetServer || !isRunning(serverName)) {
+                    console.log(`[WebRTC Tunnel] Server ${serverName} not running, rejecting tunnel.`);
+                    channel.close();
+                    return;
+                }
+                
+                try {
+                    const tcpSocket = new net.Socket();
+                    tcpSocket.connect(targetServer.port, '127.0.0.1', () => {
+                        console.log(`[WebRTC Tunnel] Connected TCP proxy for ${serverName}:${targetServer.port} [${connId}]`);
+                    });
+                    
+                    tcpSocket.on('data', (data) => {
+                        if (channel.readyState === 'open') {
+                            channel.send(data);
+                        }
+                    });
+                    
+                    channel.onMessage.subscribe((msgBuf) => {
+                        if (msgBuf instanceof Buffer) {
+                            tcpSocket.write(msgBuf);
+                        }
+                    });
+                    
+                    const cleanup = () => {
+                        tcpSocket.destroy();
+                        if (channel.readyState !== 'closed') channel.close();
+                    };
+                    
+                    tcpSocket.on('close', cleanup);
+                    tcpSocket.on('error', (err) => {
+                       console.error(`[WebRTC Tunnel] TCP Error on ${connId}:`, err);
+                       cleanup();
+                    });
+                } catch (netErr) {
+                    console.error(`[WebRTC Tunnel] TCP Error on ${connId}:`, netErr);
+                    channel.close();
+                }
+                return;
+              }
+              
+              openChannels.add(channel);
+              channel.stateChanged.subscribe(() => {
+                if (channel.readyState !== 'open') {
+                  openChannels.delete(channel);
+                }
+              });
+
+              const activeTransfers = new Map<string, {
+                writeStream?: fs.WriteStream;
+                path: string;
+                size: number;
+                received: number;
+              }>();
+              const statsInterval = setInterval(async () => {
+                if (channel.readyState === 'open') {
+                  const peerUid = channelUserMap.get(channel) || currentOwnerUid;
+                  const servers = listServers();
+                  const statsMap: Record<string, any> = {};
+                  for (const s of servers) {
+                    if (peerUid !== currentOwnerUid && !getPeerGrant(peerUid, s.name)) continue;
+                    if (isRunning(s.name)) {
+                      const stats = await getServerStats(s.name);
+                      if (stats) statsMap[s.name] = stats;
+                    }
+                  }
+                  channel.send(JSON.stringify({ type: 'stats_update', stats: statsMap }));
+                } else {
+                  clearInterval(statsInterval);
+                }
+              }, 2000);
+
+              const unsubStatus = subscribeToAllStatus(() => {
+                if (channel.readyState === 'open') {
+                  void sendServersList(channel);
+                } else {
+                  unsubStatus();
+                }
+              });
+
+              const unsubCrash = subscribeToCrash((name, analysis) => {
+                if (channel.readyState === 'open') {
+                  const peerUid = channelUserMap.get(channel) || currentOwnerUid;
+                  if (peerUid === currentOwnerUid || hasServerPerm(peerUid, name, 'canDiagnostics')) {
+                    channel.send(JSON.stringify({
+                      type: 'crash_detected',
+                      server: name,
+                      analysis
+                    }));
+                  }
+                } else {
+                  unsubCrash();
+                }
+              });
+
+              channel.onMessage.subscribe(async (msgBuf) => {
+                const text = typeof msgBuf === 'string' ? msgBuf : Buffer.from(msgBuf).toString('utf-8');
+                console.log('[WebRTC onMessage]', text?.slice(0, 120));
+                try {
+                  if (text && (text.startsWith('{') || text.startsWith('['))) {
+                    JSON.parse(text);
+                    handleClientMessage(channel, text, activeTransfers);
+                    return;
+                  }
+                } catch (e) {
+                  console.warn('[WebRTC onMessage parse error]:', e);
+                }
+                handleBinaryMessage(channel, Buffer.isBuffer(msgBuf) ? msgBuf : Buffer.from(msgBuf), activeTransfers);
+              });
+            });
+
+            pc.iceConnectionStateChange.subscribe(state => {
+              console.log(`[WebRTC] Connection state: ${state}`);
+              if (state === 'disconnected' || state === 'failed') pc.close();
+            });
+
+            let offerData: any;
+            if (typeof data.offer === 'string') {
+              offerData = JSON.parse(data.offer);
+            } else if (typeof data.offer.toJSON === 'function') {
+              offerData = data.offer.toJSON();
+            } else {
+              offerData = JSON.parse(JSON.stringify(data.offer));
+            }
+            if (!offerData?.sdp || !offerData?.type) {
+              console.error('[WebRTC] Invalid offer - missing sdp/type');
               return;
             }
-          } catch (e) {
-            logDaemonActivity('warn', `[WebRTC onMessage parse error]: ${e}`);
-          }
-          handleBinaryMessage(channel, Buffer.isBuffer(msgBuf) ? msgBuf : Buffer.from(msgBuf), activeTransfers);
-        });
-      });
+            await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp, offerData.type));
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
 
-      let disconnectTimer: NodeJS.Timeout | undefined;
-      pc.iceConnectionStateChange.subscribe((state) => {
-        console.log(`[WebRTC] Connection state (${docId}): ${state}`);
-        if (state === 'connected' || state === 'completed') {
-          if (disconnectTimer) {
-            clearTimeout(disconnectTimer);
-            disconnectTimer = undefined;
-          }
-        } else if (state === 'disconnected') {
-          if (!disconnectTimer) {
-            disconnectTimer = setTimeout(() => {
-              console.log(`[WebRTC] ICE connection remained disconnected for 5s (${docId}), closing`);
-              pc.close();
-            }, 5000);
-          }
-        } else if (state === 'failed') {
-          if (disconnectTimer) clearTimeout(disconnectTimer);
-          pc.close();
-        }
-      });
+            console.log('[WebRTC] Gathering ICE candidates...');
+            await new Promise<void>((resolve) => {
+              if (pc.iceGatheringState === 'complete') resolve();
+              else {
+                pc.iceGatheringStateChange.subscribe(state => {
+                  if (state === 'complete') resolve();
+                });
+              }
+            });
 
-      await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp, offerData.type));
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
+            const finalAnswer = pc.localDescription;
+            if (!finalAnswer) throw new Error('Failed to get local description');
 
-      console.log(`[WebRTC] Gathering ICE candidates (${docId})...`);
-      await new Promise<void>((resolve) => {
-        if (pc.iceGatheringState === 'complete') {
-          resolve();
-          return;
-        }
-        let resolved = false;
-        const timer = setTimeout(() => {
-          if (!resolved) {
-            resolved = true;
-            console.log(`[WebRTC] ICE gathering timed out after 3s (${docId}), proceeding with available candidates`);
-            resolve();
-          }
-        }, 3000);
-        const sub = pc.iceGatheringStateChange.subscribe((state) => {
-          if (state === 'complete' && !resolved) {
-            resolved = true;
-            clearTimeout(timer);
-            sub?.unSubscribe?.();
-            resolve();
-          }
-        });
-      });
-
-      const finalAnswer = pc.localDescription;
-      if (!finalAnswer) throw new Error('Failed to get local description');
-
-      await restCommit([
-        {
-          update: {
-            name: docName(`daemon_connections/${docId}`),
-            fields: {
-              status: { stringValue: 'answer' },
-              answer: {
-                mapValue: {
-                  fields: {
-                    type: { stringValue: finalAnswer.type },
-                    sdp: { stringValue: finalAnswer.sdp },
+            await restCommit([{
+              update: {
+                name: docName(`daemon_connections/${docId}`),
+                fields: {
+                  status: { stringValue: 'answer' },
+                  answer: {
+                    mapValue: {
+                      fields: {
+                        type: { stringValue: finalAnswer.type },
+                        sdp: { stringValue: finalAnswer.sdp },
+                      },
+                    },
                   },
                 },
               },
-            },
-          },
-        },
-      ]);
-      console.log(`[WebRTC] Answer sent to Firestore for ${docId}`);
-    } catch (error) {
-      console.error(`[WebRTC] Failed to handle offer ${docId}:`, error);
-      try {
-        await restCommit([
-          {
-            update: {
-              name: docName(`daemon_connections/${docId}`),
-              fields: { status: { stringValue: 'error' } },
-            },
-          },
-        ]);
-      } catch {}
-    } finally {
-      inFlightOffers.delete(docId);
-    }
-  };
-
-  unsubConnections = onSnapshot(
-    q,
-    (snapshot) => {
-      // #region agent log
-      __agentDebugLog(
-        'run2',
-        'H1',
-        'void_server/src/network/webrtc.ts:onSnapshot-offers',
-        'Offer snapshot update',
-        {
-          daemonId,
-          changes: snapshot.docChanges().map((c) => ({
-            type: c.type,
-            id: c.doc.id,
-            status: c.doc.data()?.status,
-          })),
-        }
-      );
-      // #endregion
-      for (const change of snapshot.docChanges()) {
-        if (change.type === 'added' || change.type === 'modified') {
-          const data = change.doc.data();
-          const docId = change.doc.id;
-
-          if (data.offer && data.status === 'offer') {
-            void handleIncomingOffer(docId, data);
+            }]);
+            console.log('[WebRTC] Answer sent to Firestore');
+          } catch (error) {
+            console.error('[WebRTC] Failed to handle offer:', error);
           }
         }
       }
-    },
-    (err) => {
-      console.error('[WebRTC] Offers query onSnapshot error:', err?.message || err);
     }
-  );
+  }, (err) => {
+    console.error('[WebRTC] Offers query onSnapshot error:', err?.message || err);
+  });
 
   return () => {
     teardown();
@@ -816,7 +716,6 @@ async function handleBinaryMessage(channel: any, data: Buffer, transfers: Map<st
 }
 
 async function getLocalIp() {
-  const os = await import('node:os');
   const nets = os.networkInterfaces();
   const results: string[] = [];
   
@@ -1140,7 +1039,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
     if (!payload.name && payload.serverName) payload.name = payload.serverName;
     if (!payload.server && payload.name) payload.server = payload.name;
     if (!payload.oldName && (payload.server || payload.name)) payload.oldName = payload.server ?? payload.name;
-    logDaemonActivity('webrtc', `[WebRTC] Action: ${payload.action}`);
+    console.log(`[WebRTC] Incoming Action: ${payload.action}`, payload);
 
     const peerUid = channelUserMap.get(channel) || currentOwnerUid;
     if (peerUid && peerUid !== currentOwnerUid) {
@@ -1151,7 +1050,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
     }
     switch (payload.action) {
       case 'ping': {
-        const { getPublicIp } = await import('./portForwarding.js');
         const publicIp = await getPublicIp();
         const memory = getHostMemoryStats();
         
@@ -1217,7 +1115,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       
       case 'generate_status_id': {
         const { serverName, statusId: clientStatusId } = payload;
-        const { getServerMeta, saveServerMeta } = await import('../server/manager.js');
         const meta = getServerMeta(serverName);
         if (meta) {
           if (!meta.statusId) {
@@ -1233,13 +1130,11 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'set_status_page_settings': {
         const { serverName, ...settings } = payload;
-        const { getServerMeta, saveServerMeta } = await import('../server/manager.js');
         const meta = getServerMeta(serverName);
         if (meta) {
           if (settings.statusId !== undefined && settings.statusId !== meta.statusId) {
             const db = getDb();
             try {
-              const { getDoc } = await import('firebase/firestore');
               const existingRef = doc(db, 'server_status', settings.statusId);
               const existingSnap = await getDoc(existingRef);
               if (existingSnap.exists() && existingSnap.data().name !== meta.name) {
@@ -1289,10 +1184,30 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         try {
           const serverOpts = payload.serverOpts || {};
           console.log('[WebRTC] Handling create_server action with opts:', serverOpts);
-          channel.send(JSON.stringify({
-            type: 'install_progress',
-            progress: { stage: 'creating', progress: 5, message: 'Starting installer on daemon...' }
-          }));
+
+          if (!serverOpts.name || !isValidServerName(serverOpts.name)) {
+            channel.send(JSON.stringify({
+              type: 'error',
+              message: `Creation failed: Invalid server name "${serverOpts?.name || ''}". Names must be 1-32 alphanumeric characters, dashes, or underscores.`
+            }));
+            break;
+          }
+          if (serverExists(serverOpts.name)) {
+            channel.send(JSON.stringify({
+              type: 'error',
+              message: `Creation failed: Server "${serverOpts.name}" already exists.`
+            }));
+            break;
+          }
+
+          try {
+            channel.send(JSON.stringify({
+              type: 'install_progress',
+              progress: { stage: 'creating', progress: 5, message: 'Starting installer on daemon...' }
+            }));
+          } catch (sendErr) {
+            console.warn('[WebRTC] Could not send initial install_progress:', sendErr);
+          }
 
           const port = serverOpts.port || getNextAvailablePort();
           const statusId = Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
@@ -1305,7 +1220,13 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           
           await installServer(meta, (progress) => {
             console.log('[WebRTC] installServer progress:', progress);
-            channel.send(JSON.stringify({ type: 'install_progress', progress }));
+            try {
+              if (channel.readyState === 'open') {
+                channel.send(JSON.stringify({ type: 'install_progress', progress }));
+              }
+            } catch (sendErr) {
+              console.warn('[WebRTC] Could not send install_progress:', sendErr);
+            }
           });
           
           if (serverOpts.initialProperties && typeof serverOpts.initialProperties === 'object') {
@@ -1329,10 +1250,16 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             }
           }
 
-          await sendServersList(channel);
+          try {
+            await sendServersList(channel);
+          } catch (listErr) {
+            console.warn('[WebRTC] Could not send servers list post-install:', listErr);
+          }
         } catch (err: any) {
           console.error('[WebRTC] create_server failed:', err);
-          channel.send(JSON.stringify({ type: 'error', message: `Creation failed: ${err.message || err}` }));
+          try {
+            channel.send(JSON.stringify({ type: 'error', message: `Creation failed: ${err.message || err}` }));
+          } catch {}
         }
         break;
       }
@@ -1390,7 +1317,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'set_networking_settings': {
         const { serverName, autoExpose, subdomain } = payload;
-        const { getServerMeta, saveServerMeta } = await import('../server/manager.js');
         const meta = getServerMeta(serverName);
         if (meta) {
           meta.autoExpose = autoExpose;
@@ -1418,13 +1344,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'get_versions': {
-        const { getVanillaReleases } = await import('../api/mojang.js');
-        const { getPaperVersions } = await import('../api/paper.js');
-        const { getFabricGameVersions } = await import('../api/fabric.js');
-        const { getForgeGameVersions } = await import('../api/forge.js');
-        const { getPurpurVersions } = await import('../api/purpur.js');
-        const { getNeoForgeGameVersions } = await import('../api/neoforge.js');
-        const { getQuiltGameVersions } = await import('../api/quilt.js');
         try {
           const [vanillaRes, paperRes, fabricRes, forgeRes, purpurRes, neoforgeRes, quiltRes, arclightRaw] = await Promise.all([
             getVanillaReleases().then(v => v.map(x => x.id)).catch(() => [] as string[]),
@@ -1783,7 +1702,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
               await compressFolder(fullPath, zipPath);
             } else {
               // Simple one-file zip
-              const zip = new (await import('adm-zip')).default();
+              const zip = new AdmZip();
               zip.addLocalFile(fullPath);
               zip.writeZip(zipPath);
             }
@@ -1831,8 +1750,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         try {
           if (!fs.existsSync(pluginsPath)) fs.mkdirSync(pluginsPath, { recursive: true });
           channel.send(JSON.stringify({ type: 'action_info', server, action: `Downloading ${sanitizedFileName}...` }));
-          
-          const https = await import('node:https');
           
           const download = (targetUrl: string): Promise<void> => {
             return new Promise((resolve, reject) => {
@@ -1908,8 +1825,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         try {
           if (!fs.existsSync(modsPath)) fs.mkdirSync(modsPath, { recursive: true });
           channel.send(JSON.stringify({ type: 'action_info', server, action: `Downloading ${sanitizedFileName}...` }));
-
-          const https = await import('node:https');
 
           const download = (targetUrl: string): Promise<void> => {
             return new Promise((resolve, reject) => {
@@ -1997,7 +1912,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'start_map_watcher': {
         const { server } = payload;
         if (server) {
-          const { startMapWatcher } = await import('../utils/worldMap.js');
           startMapWatcher(server);
           channel.send(JSON.stringify({ type: 'map_watcher_started', server }));
         }
@@ -2007,7 +1921,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'stop_map_watcher': {
         const { server } = payload;
         if (server) {
-          const { stopMapWatcher } = await import('../utils/worldMap.js');
           stopMapWatcher(server);
           channel.send(JSON.stringify({ type: 'map_watcher_stopped', server }));
         }
@@ -2017,7 +1930,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'get_map_metadata': {
         const { server } = payload;
         if (server) {
-          const { getMapMetadata } = await import('../utils/worldMap.js');
           const meta = getMapMetadata(server);
           channel.send(JSON.stringify({ type: 'map_metadata', server, ...meta }));
         }
@@ -2027,8 +1939,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'get_map_tile': {
         const { server, dim, rx, rz, y } = payload;
         if (server) {
-          const { getMapTile } = await import('../utils/worldMap.js');
-          
           const sendTile = (t: Buffer) => {
             const sessionId = uuidv4();
             channel.send(JSON.stringify({ type: 'map_tile_ready', sessionId, rx, rz, dim, y, size: t.length }));
@@ -2057,7 +1967,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           sendCommand(server, 'save-all');
           // Wait for Minecraft to finish writing, then re-render all tiles
           setTimeout(async () => {
-            const { refreshAllTiles } = await import('../utils/worldMap.js');
             refreshAllTiles(server);
             channel.send(JSON.stringify({ type: 'map_refresh_started', server }));
           }, 3500);
@@ -2077,7 +1986,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'get_backup_config': {
-        const { loadBackupConfig } = await import('../auth/session.js');
         const config = loadBackupConfig();
         channel.send(JSON.stringify({ type: 'backup_config', ...config }));
         break;
@@ -2085,7 +1993,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'save_backup_config': {
         const { backupServerUrl, backupToken } = payload;
-        const { saveBackupConfig } = await import('../auth/session.js');
         saveBackupConfig({ backupServerUrl, backupToken });
         channel.send(JSON.stringify({ type: 'backup_config_saved', success: true }));
         break;
@@ -2093,7 +2000,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'list_cloud_backups': {
         const { server } = payload;
-        const { getDaemonId, loadBackupConfig } = await import('../auth/session.js');
         const daemonId = getDaemonId();
         const { backupServerUrl, backupToken } = loadBackupConfig();
 
@@ -2127,7 +2033,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'create_cloud_backup': {
         const { server } = payload;
-        const { getDaemonId, loadBackupConfig } = await import('../auth/session.js');
         const daemonId = getDaemonId();
         const { backupServerUrl, backupToken } = loadBackupConfig();
 
@@ -2146,7 +2051,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
         try {
           // Zip the server folder
-          const { compressFolder } = await import('../utils/zipper.js');
           await compressFolder(serverDir, tempZipPath, (percent) => {
             const overallProgress = Math.round(percent * 0.5);
             updateBackupState(server, 'zipping', overallProgress, 'cloud');
@@ -2248,7 +2152,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'delete_cloud_backup': {
         const { server, filename } = payload;
-        const { getDaemonId, loadBackupConfig } = await import('../auth/session.js');
         const daemonId = getDaemonId();
         const { backupServerUrl, backupToken } = loadBackupConfig();
 
@@ -2293,7 +2196,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'restore_cloud_backup': {
         const { server, filename } = payload;
-        const { getDaemonId, loadBackupConfig } = await import('../auth/session.js');
         const daemonId = getDaemonId();
         const { backupServerUrl, backupToken } = loadBackupConfig();
 
@@ -2333,8 +2235,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           // Unzip/Extract backup
           updateBackupState(server, 'extracting', 90, 'restore_cloud');
           const serverDir = getServerDir(server);
-          const { extractArchive } = await import('../utils/zipper.js');
-
           await extractArchive(tempZipPath, serverDir);
           
           updateBackupState(server, 'extracting', 100, 'restore_cloud');
@@ -2357,10 +2257,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'restore_backup': {
         const { server, filename, mode, newServerName } = payload;
-        const { getServerMeta, saveServerMeta, serverExists, renameServer } = await import('../server/manager.js');
-        const { stopServer, waitForServerStop, isRunning } = await import('../server/instance.js');
-        const { getLocalBackupsDir, getServerDir } = await import('../utils/paths.js');
-        const { extractArchive } = await import('../utils/zipper.js');
 
         try {
           let targetDir: string;
@@ -2439,7 +2335,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
             // 5. Extract the backup into targetDir
             if (payload.backupType === 'cloud') {
-              const { getDaemonId, loadBackupConfig } = await import('../auth/session.js');
               const daemonId = getDaemonId();
               const { backupServerUrl, backupToken } = loadBackupConfig();
               if (!backupServerUrl || !backupToken) {
@@ -2504,7 +2399,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             targetDir = getServerDir(server);
 
             if (payload.backupType === 'cloud') {
-              const { getDaemonId, loadBackupConfig } = await import('../auth/session.js');
               const daemonId = getDaemonId();
               const { backupServerUrl, backupToken } = loadBackupConfig();
               if (!backupServerUrl || !backupToken) {
@@ -2553,7 +2447,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'get_local_backup_limit': {
-        const { loadLocalBackupLimit } = await import('../auth/session.js');
         const limit = loadLocalBackupLimit();
         channel.send(JSON.stringify({ type: 'local_backup_limit', limitEnabled: limit.enabled, limitType: limit.type, limitValue: limit.value }));
         break;
@@ -2561,7 +2454,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'save_local_backup_limit': {
         const { limitEnabled, limitType, limitValue } = payload;
-        const { saveLocalBackupLimit } = await import('../auth/session.js');
         saveLocalBackupLimit({ enabled: limitEnabled ?? true, type: limitType, value: limitValue });
         channel.send(JSON.stringify({ type: 'local_backup_limit_saved', success: true, limitEnabled: limitEnabled ?? true, limitType, limitValue }));
         break;
@@ -2569,7 +2461,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'list_local_backups': {
         const { server } = payload;
-        const { getLocalBackupsDir } = await import('../utils/paths.js');
         const backupsDir = getLocalBackupsDir(server);
         
         try {
@@ -2599,8 +2490,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'create_local_backup': {
         const { server } = payload;
-        const { getLocalBackupsDir, getServerDir } = await import('../utils/paths.js');
-        const { loadLocalBackupLimit } = await import('../auth/session.js');
         
         const backupsDir = getLocalBackupsDir(server);
         const serverDir = getServerDir(server);
@@ -2641,7 +2530,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         activeBackupControllers.set(server, controller);
 
         try {
-          const { compressFolder } = await import('../utils/zipper.js');
+
           await compressFolder(serverDir, tempBackupPath, (percent) => {
             updateBackupState(server, 'zipping', percent, 'local');
           }, controller.signal);
@@ -2734,7 +2623,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'delete_local_backup': {
         const { server, filename } = payload;
-        const { getLocalBackupsDir } = await import('../utils/paths.js');
         const backupsDir = getLocalBackupsDir(server);
         const filePath = path.join(backupsDir, filename);
         
@@ -2770,7 +2658,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'restore_local_backup': {
         const { server, filename } = payload;
-        const { getLocalBackupsDir, getServerDir } = await import('../utils/paths.js');
         const backupsDir = getLocalBackupsDir(server);
         const filePath = path.join(backupsDir, filename);
         const serverDir = getServerDir(server);
@@ -2788,7 +2675,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           }
           
           updateBackupState(server, 'extracting', 50, 'restore_local');
-          const { extractArchive } = await import('../utils/zipper.js');
           await extractArchive(filePath, serverDir);
           
           updateBackupState(server, 'extracting', 100, 'restore_local');

@@ -5,7 +5,11 @@ import TextInput from 'ink-text-input';
 import Spinner from 'ink-spinner';
 import { getVanillaReleases } from '../../api/mojang.js';
 import { getPaperVersions } from '../../api/paper.js';
+import { getPurpurVersions } from '../../api/purpur.js';
 import { getFabricGameVersions } from '../../api/fabric.js';
+import { getForgeGameVersions } from '../../api/forge.js';
+import { getNeoForgeGameVersions } from '../../api/neoforge.js';
+import { getQuiltGameVersions } from '../../api/quilt.js';
 import { installServer, type InstallProgress } from '../../server/installer.js';
 import {
   isValidServerName,
@@ -87,23 +91,18 @@ export const CreateServerScreen: React.FC<Props> = ({ onDone, onBack }) => {
         const releases = await getVanillaReleases();
         setVersions(releases.slice(0, 25).map(v => v.id));
       } else if (type === 'paper' || type === 'purpur') {
-        const { getPurpurVersions } = await import('../../api/purpur.js');
-        const { getPaperVersions } = await import('../../api/paper.js');
         const v = type === 'purpur' ? await getPurpurVersions() : await getPaperVersions();
         setVersions(v.slice(0, 25));
       } else if (type === 'fabric') {
         const v = await getFabricGameVersions(25);
         setVersions(v);
       } else if (type === 'forge') {
-        const { getForgeGameVersions } = await import('../../api/forge.js');
         const v = await getForgeGameVersions(25);
         setVersions(v);
       } else if (type === 'neoforge') {
-        const { getNeoForgeGameVersions } = await import('../../api/neoforge.js');
         const v = await getNeoForgeGameVersions(25);
         setVersions(v);
       } else if (type === 'quilt') {
-        const { getQuiltGameVersions } = await import('../../api/quilt.js');
         const v = await getQuiltGameVersions(25);
         setVersions(v);
       }

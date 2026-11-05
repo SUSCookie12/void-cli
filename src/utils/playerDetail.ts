@@ -1,4 +1,5 @@
 import fsp from 'node:fs/promises';
+import * as nbt from 'prismarine-nbt';
 import path from 'node:path';
 import { getServerDir } from './paths.js';
 import { readProperties } from '../server/properties.js';
@@ -191,8 +192,8 @@ export async function getPlayerDetail(serverName: string, uuid: string, playerNa
   }
 
   // Lazy import so normal flows don’t pay cost
-  const nbt = await import('prismarine-nbt');
-  const { parse, simplify } = nbt as any;
+  const nbtModule = (nbt as any).default || (nbt as any);
+  const { parse, simplify } = nbtModule;
 
   // `.dat` is gzipped NBT
   const parsed = await new Promise<any>((resolve, reject) => {

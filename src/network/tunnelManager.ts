@@ -3,6 +3,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import https from 'node:https';
 import os from 'node:os';
+import AdmZip from 'adm-zip';
+import * as tar from 'tar';
 import { registerTunnelDns, registerDirectDns, deleteTunnelDns } from './dnsManager.js';
 import { tryPortForward, removePortForward, getPublicIp } from './portForwarding.js';
 
@@ -49,11 +51,11 @@ async function downloadBore(onProgress?: (msg: string) => void): Promise<void> {
           file.close();
           try {
             if (assetName.endsWith('.zip')) {
-              const AdmZip = (await import('adm-zip')).default;
+
               const zip = new AdmZip(archivePath);
               zip.extractAllTo(BORE_DIR, true);
             } else {
-              const tar = await import('tar');
+
               await tar.extract({ file: archivePath, cwd: BORE_DIR });
             }
             if (os.platform() !== 'win32') fs.chmodSync(BORE_BIN, 0o755);

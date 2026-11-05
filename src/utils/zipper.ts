@@ -17,11 +17,12 @@ const getCurrentFilePath = (): string => {
 // Standalone JS worker code to be run in development via eval: true.
 // Uses streaming archiver with Zip64 to handle archives of any size (>2GB, >4GB) without Buffer limits.
 const devWorkerCode = `
-(async () => {
-  const { parentPort, workerData } = await import('worker_threads');
-  const archiver = (await import('archiver')).default || (await import('archiver'));
-  const fs = await import('fs');
-  const path = await import('path');
+(() => {
+  const { parentPort, workerData } = require('worker_threads');
+  const archiverModule = require('archiver');
+  const archiver = archiverModule.default || archiverModule;
+  const fs = require('fs');
+  const path = require('path');
 
   try {
     const { task, data } = workerData || {};

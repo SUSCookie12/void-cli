@@ -14,7 +14,9 @@ import { getArclightDownloadInfo } from '../api/arclight.js';
 import { detectJava, getRequiredJava } from '../utils/java.js';
 import { downloadFile } from '../utils/download.js';
 export { downloadFile };
-import { saveServerMeta } from './manager.js';
+import { saveServerMeta, getNextAvailablePort } from './manager.js';
+import { listServerJarsInDir } from './instance.js';
+import { extractArchive } from '../utils/zipper.js';
 import type { ServerMeta } from './manager.js';
 
 export interface InstallProgress {
@@ -489,7 +491,7 @@ export interface ServerDirectoryInspection {
 }
 
 export async function inspectServerDirectory(serverDir: string): Promise<ServerDirectoryInspection> {
-  const { listServerJarsInDir } = await import('./instance.js');
+
   const jars = listServerJarsInDir(serverDir);
 
   let existingMeta: Partial<ServerMeta> | null = null;
@@ -608,8 +610,8 @@ export async function importServerFromSource(
   opts: ImportServerOptions,
   onProgress: (p: InstallProgress) => void
 ): Promise<ServerMeta> {
-  const { getNextAvailablePort } = await import('./manager.js');
-  const { extractArchive } = await import('../utils/zipper.js');
+
+
   const serverDir = getServerDir(opts.name);
 
   try {
