@@ -551,8 +551,18 @@ export function initWebRTCSignaling(uid: string, daemonId: string): () => void {
               }
               
               openChannels.add(channel);
-              channel.stateChanged.subscribe(() => {
-                if (channel.readyState !== 'open') {
+              const pushInitialServers = () => {
+                if (channel.readyState === 'open') {
+                  void sendServersList(channel);
+                }
+              };
+              if (channel.readyState === 'open') {
+                setTimeout(pushInitialServers, 50);
+              }
+              channel.stateChanged.subscribe((state) => {
+                if (state === 'open') {
+                  setTimeout(pushInitialServers, 50);
+                } else {
                   openChannels.delete(channel);
                 }
               });

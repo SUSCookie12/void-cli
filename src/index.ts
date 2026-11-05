@@ -152,6 +152,14 @@ if (!isMainThread) {
           // ignore malformed JSON
         }
       });
+      process.stdin.on('end', () => {
+        console.log('[VOID] stdin EOF received (parent exited), shutting down...');
+        void shutdown();
+      });
+      process.stdin.on('close', () => {
+        console.log('[VOID] stdin closed (parent exited), shutting down...');
+        void shutdown();
+      });
     }
   }
 

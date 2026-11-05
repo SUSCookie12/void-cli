@@ -44,7 +44,7 @@ export async function getPaperVersions(): Promise<string[]> {
   }
 
   // Drop pre-releases (e.g. "26.2-rc-2") and sort semantic versioning descending.
-  return [...new Set(all)].filter(v => !v.includes('-')).sort((a, b) => {
+  return [...new Set(all)].filter(v => v.startsWith('1.') && !v.includes('-')).sort((a, b) => {
     const pa = a.split('.').map(Number);
     const pb = b.split('.').map(Number);
     for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
