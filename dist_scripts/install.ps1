@@ -5,7 +5,7 @@
 $repo = "SUSCookie12/void-cli"
 $installDir = "$HOME\.void"
 $binName = "voidmc.exe"
-$versionTag = "v0.1.6"
+$versionTag = "v0.1.7"
 $urlPinned = "https://github.com/$repo/releases/download/$versionTag/$binName"
 $urlLatest = "https://github.com/$repo/releases/latest/download/$binName"
 

@@ -1,6 +1,6 @@
 {
   "name": "void-server",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "description": "Void Server Daemon — Minecraft Server Management",
   "type": "module",
   "main": "dist/bundle.cjs",

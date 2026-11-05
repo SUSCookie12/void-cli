@@ -1,13 +1,15 @@
 import React, { useState, useEffect, useLayoutEffect } from 'react';
-import { render } from 'ink';
+import { Box, render } from 'ink';
 import { AuthScreen } from './screens/AuthScreen.js';
 import { HomeScreen } from './screens/HomeScreen.js';
 import { CreateServerScreen } from './screens/CreateServerScreen.js';
 import { ServerDetailScreen } from './screens/ServerDetailScreen.js';
+import { DaemonConsoleBox } from './components/DaemonConsoleBox.js';
 import { loadSession, clearSession, type UserSession } from '../auth/session.js';
 import { getServerMeta } from '../server/manager.js';
 import { initWebRTCSignaling } from '../network/webrtc.js';
 import { registerSessionRevokedHandler } from '../auth/sessionEvents.js';
+import { setupTuiLogger, restoreConsoleLogger } from '../utils/activityLogger.js';
 
 type View = 'auth' | 'home' | 'create' | 'server';
 
@@ -15,6 +17,24 @@ const VoidApp: React.FC = () => {
   const [session, setSession] = useState<UserSession | null>(() => loadSession());
   const [view, setView] = useState<View>(() => (loadSession() ? 'home' : 'auth'));
   const [selectedServer, setSelectedServer] = useState<string | null>(null);
+
+  const [termSize, setTermSize] = useState(() => ({
+    columns: process.stdout.columns || 110,
+    rows: process.stdout.rows || 30,
+  }));
+
+  useEffect(() => {
+    const handleResize = () => {
+      setTermSize({
+        columns: process.stdout.columns || 110,
+        rows: process.stdout.rows || 30,
+      });
+    };
+    process.stdout.on('resize', handleResize);
+    return () => {
+      process.stdout.removeListener('resize', handleResize);
+    };
+  }, []);
 
   useLayoutEffect(() => {
     registerSessionRevokedHandler(() => {
@@ -43,44 +63,71 @@ const VoidApp: React.FC = () => {
     setView('auth');
   };
 
+  let content: React.ReactNode = null;
   if (view === 'auth') {
-    return <AuthScreen onAuthenticated={handleAuthenticated} />;
-  }
-
-  if (view === 'create') {
-    return (
+    content = <AuthScreen onAuthenticated={handleAuthenticated} />;
+  } else if (view === 'create') {
+    content = (
       <CreateServerScreen
         onDone={() => setView('home')}
         onBack={() => setView('home')}
       />
     );
-  }
-
-  if (view === 'server' && selectedServer) {
+  } else if (view === 'server' && selectedServer) {
     const meta = getServerMeta(selectedServer);
     if (!meta) {
       setView('home');
-      return null;
+    } else {
+      content = (
+        <ServerDetailScreen
+          meta={meta}
+          session={session!}
+          onBack={() => setView('home')}
+        />
+      );
     }
-    return (
-      <ServerDetailScreen
-        meta={meta}
+  } else {
+    content = (
+      <HomeScreen
         session={session!}
-        onBack={() => setView('home')}
+        onCreateServer={() => setView('create')}
+        onOpenServer={name => {
+          setSelectedServer(name);
+          setView('server');
+        }}
+        onLogout={handleLogout}
       />
     );
   }
 
+  // Calculate layout widths
+  // Left content needs ~76 columns for the main TUI cards
+  const totalCols = termSize.columns || 110;
+  const isWide = totalCols >= 96;
+  const leftWidth = isWide ? Math.min(78, totalCols - 34) : totalCols;
+  const rightWidth = isWide ? Math.max(32, totalCols - leftWidth - 2) : totalCols;
+  const consoleHeight = Math.max(22, (termSize.rows || 28) - 2);
+
+  if (!isWide) {
+    return (
+      <Box flexDirection="column">
+        {content}
+        <Box marginTop={1}>
+          <DaemonConsoleBox width={totalCols} height={12} />
+        </Box>
+      </Box>
+    );
+  }
+
   return (
-    <HomeScreen
-      session={session!}
-      onCreateServer={() => setView('create')}
-      onOpenServer={name => {
-        setSelectedServer(name);
-        setView('server');
-      }}
-      onLogout={handleLogout}
-    />
+    <Box flexDirection="row">
+      <Box flexDirection="column" width={leftWidth}>
+        {content}
+      </Box>
+      <Box flexDirection="column" width={rightWidth} marginLeft={1}>
+        <DaemonConsoleBox width={rightWidth} height={consoleHeight} />
+      </Box>
+    </Box>
   );
 };
 
@@ -95,6 +142,13 @@ function initializeLogic() {
 }
 
 export function startUI(): void {
+  if (process.stdin.isTTY) {
+    setupTuiLogger();
+    try {
+      process.stdout.write('\x1b[2J\x1b[H');
+    } catch {}
+  }
+
   // Always initialize background logic (WebRTC) regardless of TTY
   initializeLogic();
 
@@ -108,6 +162,7 @@ export function startUI(): void {
   try {
     render(<VoidApp />);
   } catch (err) {
+    restoreConsoleLogger();
     console.error('[VOID] Failed to start UI, staying in headless mode:', err);
     setInterval(() => {}, 1000 * 60 * 60);
   }

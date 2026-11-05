@@ -8,7 +8,7 @@ set -e
 REPO="SUSCookie12/void-cli"
 INSTALL_DIR="$HOME/.void"
 BIN_NAME="voidmc"
-VERSION_TAG="v0.1.6"
+VERSION_TAG="v0.1.7"
 BIN_URL_PINNED="https://github.com/${REPO}/releases/download/${VERSION_TAG}/voidmc-linux"
 BIN_URL_LATEST="https://github.com/${REPO}/releases/latest/download/voidmc-linux"
 

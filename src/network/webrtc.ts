@@ -65,6 +65,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { clearSession } from '../auth/session.js';
 import { notifySessionRevoked } from '../auth/sessionEvents.js';
 import { getHostCpuPercent, getHostMemoryStats } from '../utils/hostStats.js';
+import { logDaemonActivity } from '../utils/activityLogger.js';
 
 const PROJECT = 'cookiemovie-27669';
 const DB = '(default)';
@@ -590,7 +591,7 @@ export function initWebRTCSignaling(uid: string, daemonId: string): () => void {
 
               channel.onMessage.subscribe(async (msgBuf) => {
                 const text = typeof msgBuf === 'string' ? msgBuf : Buffer.from(msgBuf).toString('utf-8');
-                console.log('[WebRTC onMessage]', text?.slice(0, 120));
+                logDaemonActivity('webrtc', `[WebRTC onMessage] ${text?.slice(0, 120)}`);
                 try {
                   if (text && (text.startsWith('{') || text.startsWith('['))) {
                     JSON.parse(text);
@@ -598,7 +599,7 @@ export function initWebRTCSignaling(uid: string, daemonId: string): () => void {
                     return;
                   }
                 } catch (e) {
-                  console.warn('[WebRTC onMessage parse error]:', e);
+                  logDaemonActivity('warn', `[WebRTC onMessage parse error]: ${e}`);
                 }
                 handleBinaryMessage(channel, Buffer.isBuffer(msgBuf) ? msgBuf : Buffer.from(msgBuf), activeTransfers);
               });
@@ -1024,7 +1025,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
     if (!payload.name && payload.serverName) payload.name = payload.serverName;
     if (!payload.server && payload.name) payload.server = payload.name;
     if (!payload.oldName && (payload.server || payload.name)) payload.oldName = payload.server ?? payload.name;
-    console.log(`[WebRTC] Incoming Action: ${payload.action}`, payload);
+    logDaemonActivity('webrtc', `[WebRTC] Action: ${payload.action}`);
 
     const peerUid = channelUserMap.get(channel) || currentOwnerUid;
     if (peerUid && peerUid !== currentOwnerUid) {

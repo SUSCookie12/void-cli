@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 import { isMainThread, parentPort, workerData } from 'node:worker_threads';
+import { createInterface } from 'node:readline';
 import { startUI } from './ui/App.js';
 import { initFirebase } from './config/firebase.js';
 import { enforceVoidServerVersionFromRemote } from './config/remoteVersion.js';
 import { DAEMON_VERSION } from './version.js';
 import { stopAllServers, setShuttingDown } from './server/instance.js';
+import { setupTuiLogger } from './utils/activityLogger.js';
+import { startScheduler } from './server/scheduler.js';
+import { startStatusPageUpdater } from './server/statusPage.js';
 
 if (!isMainThread) {
   // Background worker thread using streaming archiver (Zip64 support for >2GB archives)
@@ -123,17 +127,17 @@ if (!isMainThread) {
   process.on('SIGTERM', shutdown);
 
   async function main(): Promise<void> {
+    if (process.stdin.isTTY) {
+      setupTuiLogger();
+    }
     await enforceVoidServerVersionFromRemote();
     initFirebase();
-    const { startScheduler } = await import('./server/scheduler.js');
     startScheduler();
-    const { startStatusPageUpdater } = await import('./server/statusPage.js');
     startStatusPageUpdater();
     startUI();
 
     // Headless mode: read JSON commands from stdin
     if (!process.stdin.isTTY) {
-      const { createInterface } = await import('node:readline');
       const rl = createInterface({ input: process.stdin });
       rl.on('line', (line: string) => {
         try {
