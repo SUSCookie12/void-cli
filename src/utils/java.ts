@@ -3,6 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import fs from 'node:fs';
 import { getVoidDir } from './paths.js';
+import { downloadFile } from './download.js';
 import * as tar from 'tar';
 import AdmZip from 'adm-zip';
 
@@ -130,34 +131,9 @@ export async function installJava(version: number, onProgress: (msg: string) => 
 
   onProgress(`Downloading Java ${version} (${adoptOs}/${adoptArch})...`);
 
-  const res = await fetch(url);
-  if (!res.ok || !res.body) throw new Error(`Failed to download Java: ${res.statusText}`);
-
-  const total = Number(res.headers.get('content-length') || 0);
   const tempFile = path.join(getVoidDir(), 'java', `temp_jre_${version}.${extension}`);
-  
-  const fileStream = fs.createWriteStream(tempFile);
-  const reader = res.body.getReader();
-  let downloaded = 0;
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    fileStream.write(value);
-    downloaded += value.length;
-
-    if (total > 0) {
-      const percentage = ((downloaded / total) * 100).toFixed(1);
-      onProgress(`Downloading Java ${version}... ${percentage}%`);
-    } else {
-      onProgress(`Downloading Java ${version}... ${(downloaded / 1024 / 1024).toFixed(1)} MB`);
-    }
-  }
-  
-  await new Promise<void>((resolve, reject) => {
-    fileStream.on('finish', resolve);
-    fileStream.on('error', reject);
-    fileStream.end();
+  await downloadFile(url, tempFile, pct => {
+    onProgress(`Downloading Java ${version}... ${pct}%`);
   });
 
   onProgress(`Extracting Java ${version}...`);

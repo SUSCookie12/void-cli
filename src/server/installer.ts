@@ -12,6 +12,8 @@ import { getNeoForgeInstallerInfo } from '../api/neoforge.js';
 import { getQuiltInstallerInfo } from '../api/quilt.js';
 import { getArclightDownloadInfo } from '../api/arclight.js';
 import { detectJava, getRequiredJava } from '../utils/java.js';
+import { downloadFile } from '../utils/download.js';
+export { downloadFile };
 import { saveServerMeta } from './manager.js';
 import type { ServerMeta } from './manager.js';
 
@@ -439,49 +441,6 @@ export async function installServer(
     throw err;
   }
 }
-
-async function downloadFile(
-  url: string,
-  dest: string,
-  onProgress: (pct: number) => void
-): Promise<void> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Download failed: ${res.status} ${res.statusText}`);
-
-  const contentLength = res.headers.get('content-length');
-  const total = contentLength ? parseInt(contentLength) : 0;
-  let downloaded = 0;
-
-  const fileStream = createWriteStream(dest);
-  const reader = res.body!.getReader();
-
-  return new Promise((resolve, reject) => {
-    fileStream.on('error', reject);
-
-    const pump = async () => {
-      try {
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) {
-            fileStream.end(() => resolve());
-            break;
-          }
-          downloaded += value.length;
-          if (total > 0) onProgress(Math.floor((downloaded / total) * 100));
-          await new Promise<void>((ok, fail) => {
-            fileStream.write(value, err => (err ? fail(err) : ok()));
-          });
-        }
-      } catch (err) {
-        fileStream.destroy();
-        reject(err);
-      }
-    };
-
-    pump();
-  });
-}
-
 
 export function unwrapSingleRootFolder(serverDir: string): void {
   for (let depth = 0; depth < 2; depth++) {

@@ -428,243 +428,358 @@ export function initWebRTCSignaling(uid: string, daemonId: string): () => void {
     notifySessionRevoked();
   });
 
-  unsubConnections = onSnapshot(q, async (snapshot) => {
-    // #region agent log
-    __agentDebugLog(
-      'run2',
-      'H1',
-      'void_server/src/network/webrtc.ts:onSnapshot-offers',
-      'Offer snapshot update',
-      {
-        daemonId,
-        changes: snapshot.docChanges().map(c => ({
-          type: c.type,
-          id: c.doc.id,
-          status: c.doc.data()?.status
-        }))
+  const inFlightOffers = new Set<string>();
+
+  const handleIncomingOffer = async (docId: string, data: any) => {
+    if (inFlightOffers.has(docId)) return;
+    inFlightOffers.add(docId);
+
+    try {
+      // 1. Filter out stale offers (older than 45 seconds) to avoid hanging on abandoned client sessions
+      const offerTime = data.createdAt ? new Date(data.createdAt).getTime() : Number(docId.split('_').pop());
+      const isStale = offerTime > 0 && !isNaN(offerTime) && (Date.now() - offerTime > 45000);
+      if (isStale) {
+        console.log(`[WebRTC] Skipping stale offer ${docId} (created ${Math.round((Date.now() - offerTime) / 1000)}s ago)`);
+        try {
+          await restCommit([{
+            update: {
+              name: docName(`daemon_connections/${docId}`),
+              fields: { status: { stringValue: 'stale' } },
+            },
+          }]);
+        } catch {}
+        return;
       }
-    );
-    // #endregion
-    for (const change of snapshot.docChanges()) {
-      if (change.type === 'added') {
-        const data = change.doc.data();
-        const docId = change.doc.id;
 
-        if (data.offer && data.status === 'offer') {
-          // #region agent log
-          __agentDebugLog(
-            'run2',
-            'H2',
-            'void_server/src/network/webrtc.ts:received-offer',
-            'Received matching offer',
-            {
-              daemonId,
-              docId,
-              offerType: data.offer?.type
-            }
-          );
-          // #endregion
-          console.log(`[WebRTC] Received offer for node ${daemonId} from ${docId}`);
-          const peerUserId = String(data.userId || data.clientUid || uid);
-          if (peerUserId !== currentOwnerUid) {
-            await refreshServerAccessGrants();
+      let offerData: any;
+      if (typeof data.offer === 'string') {
+        offerData = JSON.parse(data.offer);
+      } else if (typeof data.offer?.toJSON === 'function') {
+        offerData = data.offer.toJSON();
+      } else {
+        offerData = JSON.parse(JSON.stringify(data.offer || {}));
+      }
+
+      if (!offerData?.sdp || !offerData?.type) {
+        console.error(`[WebRTC] Invalid offer ${docId} - missing sdp/type`);
+        try {
+          await restCommit([{
+            update: {
+              name: docName(`daemon_connections/${docId}`),
+              fields: { status: { stringValue: 'invalid' } },
+            },
+          }]);
+        } catch {}
+        return;
+      }
+
+      // #region agent log
+      __agentDebugLog(
+        'run2',
+        'H2',
+        'void_server/src/network/webrtc.ts:received-offer',
+        'Received matching offer',
+        {
+          daemonId,
+          docId,
+          offerType: offerData?.type,
+        }
+      );
+      // #endregion
+      console.log(`[WebRTC] Received offer for node ${daemonId} from ${docId}`);
+      const peerUserId = String(data.userId || data.clientUid || uid);
+      if (peerUserId !== currentOwnerUid) {
+        await refreshServerAccessGrants();
+      }
+
+      const pc = new RTCPeerConnection({
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun1.l.google.com:19302' },
+          { urls: 'stun:stun.cloudflare.com:3478' },
+        ],
+      });
+
+      pc.onDataChannel.subscribe((channel) => {
+        channelUserMap.set(channel, peerUserId);
+        // #region agent log
+        __agentDebugLog(
+          'run2',
+          'H3',
+          'void_server/src/network/webrtc.ts:onDataChannel',
+          'DataChannel opened',
+          {
+            daemonId,
+            label: channel.label,
+            readyState: channel.readyState,
           }
-          try {
-            const pc = new RTCPeerConnection({
-              iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+        );
+        // #endregion
+        console.log(`[WebRTC] DataChannel ${channel.label} opened`);
+
+        if (channel.label.startsWith('tunnel::')) {
+          const parts = channel.label.split('::');
+          const serverName = parts[1];
+          const connId = parts[2];
+
+          const targetServer = listServers().find((s) => s.name === serverName);
+          if (!targetServer || !isRunning(serverName)) {
+            console.log(`[WebRTC Tunnel] Server ${serverName} not running, rejecting tunnel.`);
+            channel.close();
+            return;
+          }
+
+          import('node:net').then((net) => {
+            const tcpSocket = new net.Socket();
+            tcpSocket.connect(targetServer.port, '127.0.0.1', () => {
+              console.log(`[WebRTC Tunnel] Connected TCP proxy for ${serverName}:${targetServer.port} [${connId}]`);
             });
 
-            pc.onDataChannel.subscribe((channel) => {
-              channelUserMap.set(channel, peerUserId);
-              // #region agent log
-              __agentDebugLog(
-                'run2',
-                'H3',
-                'void_server/src/network/webrtc.ts:onDataChannel',
-                'DataChannel opened',
-                {
-                  daemonId,
-                  label: channel.label,
-                  readyState: channel.readyState
-                }
-              );
-              // #endregion
-              console.log(`[WebRTC] DataChannel ${channel.label} opened`);
-              
-              if (channel.label.startsWith('tunnel::')) {
-                const parts = channel.label.split('::');
-                const serverName = parts[1];
-                const connId = parts[2];
-                
-                const targetServer = listServers().find(s => s.name === serverName);
-                if (!targetServer || !isRunning(serverName)) {
-                    console.log(`[WebRTC Tunnel] Server ${serverName} not running, rejecting tunnel.`);
-                    channel.close();
-                    return;
-                }
-                
-                import('node:net').then((net) => {
-                    const tcpSocket = new net.Socket();
-                    tcpSocket.connect(targetServer.port, '127.0.0.1', () => {
-                        console.log(`[WebRTC Tunnel] Connected TCP proxy for ${serverName}:${targetServer.port} [${connId}]`);
-                    });
-                    
-                    tcpSocket.on('data', (data) => {
-                        if (channel.readyState === 'open') {
-                            channel.send(data);
-                        }
-                    });
-                    
-                    channel.onMessage.subscribe((msgBuf) => {
-                        if (msgBuf instanceof Buffer) {
-                            tcpSocket.write(msgBuf);
-                        }
-                    });
-                    
-                    const cleanup = () => {
-                        tcpSocket.destroy();
-                        if (channel.readyState !== 'closed') channel.close();
-                    };
-                    
-                    tcpSocket.on('close', cleanup);
-                    tcpSocket.on('error', (err) => {
-                       console.error(`[WebRTC Tunnel] TCP Error on ${connId}:`, err);
-                       cleanup();
-                    });
-                });
-                return;
+            tcpSocket.on('data', (sockData) => {
+              if (channel.readyState === 'open') {
+                channel.send(sockData);
               }
-              
-              openChannels.add(channel);
-              channel.stateChanged.subscribe(() => {
-                if (channel.readyState !== 'open') {
-                  openChannels.delete(channel);
-                }
-              });
-
-              const activeTransfers = new Map<string, {
-                writeStream?: fs.WriteStream;
-                path: string;
-                size: number;
-                received: number;
-              }>();
-              const statsInterval = setInterval(async () => {
-                if (channel.readyState === 'open') {
-                  const peerUid = channelUserMap.get(channel) || currentOwnerUid;
-                  const servers = listServers();
-                  const statsMap: Record<string, any> = {};
-                  for (const s of servers) {
-                    if (peerUid !== currentOwnerUid && !getPeerGrant(peerUid, s.name)) continue;
-                    if (isRunning(s.name)) {
-                      const stats = await getServerStats(s.name);
-                      if (stats) statsMap[s.name] = stats;
-                    }
-                  }
-                  channel.send(JSON.stringify({ type: 'stats_update', stats: statsMap }));
-                } else {
-                  clearInterval(statsInterval);
-                }
-              }, 2000);
-
-              const unsubStatus = subscribeToAllStatus(() => {
-                if (channel.readyState === 'open') {
-                  void sendServersList(channel);
-                } else {
-                  unsubStatus();
-                }
-              });
-
-              const unsubCrash = subscribeToCrash((name, analysis) => {
-                if (channel.readyState === 'open') {
-                  const peerUid = channelUserMap.get(channel) || currentOwnerUid;
-                  if (peerUid === currentOwnerUid || hasServerPerm(peerUid, name, 'canDiagnostics')) {
-                    channel.send(JSON.stringify({
-                      type: 'crash_detected',
-                      server: name,
-                      analysis
-                    }));
-                  }
-                } else {
-                  unsubCrash();
-                }
-              });
-
-              channel.onMessage.subscribe(async (msgBuf) => {
-                const text = typeof msgBuf === 'string' ? msgBuf : Buffer.from(msgBuf).toString('utf-8');
-                logDaemonActivity('webrtc', `[WebRTC onMessage] ${text?.slice(0, 120)}`);
-                try {
-                  if (text && (text.startsWith('{') || text.startsWith('['))) {
-                    JSON.parse(text);
-                    handleClientMessage(channel, text, activeTransfers);
-                    return;
-                  }
-                } catch (e) {
-                  logDaemonActivity('warn', `[WebRTC onMessage parse error]: ${e}`);
-                }
-                handleBinaryMessage(channel, Buffer.isBuffer(msgBuf) ? msgBuf : Buffer.from(msgBuf), activeTransfers);
-              });
             });
 
-            pc.iceConnectionStateChange.subscribe(state => {
-              console.log(`[WebRTC] Connection state: ${state}`);
-              if (state === 'disconnected' || state === 'failed') pc.close();
+            channel.onMessage.subscribe((msgBuf) => {
+              if (msgBuf instanceof Buffer) {
+                tcpSocket.write(msgBuf);
+              }
             });
 
-            let offerData: any;
-            if (typeof data.offer === 'string') {
-              offerData = JSON.parse(data.offer);
-            } else if (typeof data.offer.toJSON === 'function') {
-              offerData = data.offer.toJSON();
-            } else {
-              offerData = JSON.parse(JSON.stringify(data.offer));
+            const cleanup = () => {
+              tcpSocket.destroy();
+              if (channel.readyState !== 'closed') channel.close();
+            };
+
+            tcpSocket.on('close', cleanup);
+            tcpSocket.on('error', (err) => {
+              console.error(`[WebRTC Tunnel] TCP Error on ${connId}:`, err);
+              cleanup();
+            });
+          });
+          return;
+        }
+
+        openChannels.add(channel);
+
+        const activeTransfers = new Map<
+          string,
+          {
+            writeStream?: fs.WriteStream;
+            path: string;
+            size: number;
+            received: number;
+          }
+        >();
+
+        let statsInterval: NodeJS.Timeout | undefined;
+        let unsubStatus: (() => void) | undefined;
+        let unsubCrash: (() => void) | undefined;
+
+        const cleanupChannel = () => {
+          openChannels.delete(channel);
+          if (statsInterval) {
+            clearInterval(statsInterval);
+            statsInterval = undefined;
+          }
+          if (unsubStatus) {
+            unsubStatus();
+            unsubStatus = undefined;
+          }
+          if (unsubCrash) {
+            unsubCrash();
+            unsubCrash = undefined;
+          }
+        };
+
+        channel.stateChanged.subscribe(() => {
+          if (channel.readyState !== 'open') {
+            cleanupChannel();
+          }
+        });
+
+        statsInterval = setInterval(async () => {
+          if (channel.readyState === 'open') {
+            const peerUid = channelUserMap.get(channel) || currentOwnerUid;
+            const servers = listServers();
+            const statsMap: Record<string, any> = {};
+            for (const s of servers) {
+              if (peerUid !== currentOwnerUid && !getPeerGrant(peerUid, s.name)) continue;
+              if (isRunning(s.name)) {
+                const stats = await getServerStats(s.name);
+                if (stats) statsMap[s.name] = stats;
+              }
             }
-            if (!offerData?.sdp || !offerData?.type) {
-              console.error('[WebRTC] Invalid offer - missing sdp/type');
+            channel.send(JSON.stringify({ type: 'stats_update', stats: statsMap }));
+          } else {
+            cleanupChannel();
+          }
+        }, 2000);
+
+        unsubStatus = subscribeToAllStatus(() => {
+          if (channel.readyState === 'open') {
+            void sendServersList(channel);
+          } else {
+            cleanupChannel();
+          }
+        });
+
+        unsubCrash = subscribeToCrash((name, analysis) => {
+          if (channel.readyState === 'open') {
+            const peerUid = channelUserMap.get(channel) || currentOwnerUid;
+            if (peerUid === currentOwnerUid || hasServerPerm(peerUid, name, 'canDiagnostics')) {
+              channel.send(
+                JSON.stringify({
+                  type: 'crash_detected',
+                  server: name,
+                  analysis,
+                })
+              );
+            }
+          } else {
+            cleanupChannel();
+          }
+        });
+
+        channel.onMessage.subscribe(async (msgBuf) => {
+          const text = typeof msgBuf === 'string' ? msgBuf : Buffer.from(msgBuf).toString('utf-8');
+          logDaemonActivity('webrtc', `[WebRTC onMessage] ${text?.slice(0, 120)}`);
+          try {
+            if (text && (text.startsWith('{') || text.startsWith('['))) {
+              JSON.parse(text);
+              handleClientMessage(channel, text, activeTransfers);
               return;
             }
-            await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp, offerData.type));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+          } catch (e) {
+            logDaemonActivity('warn', `[WebRTC onMessage parse error]: ${e}`);
+          }
+          handleBinaryMessage(channel, Buffer.isBuffer(msgBuf) ? msgBuf : Buffer.from(msgBuf), activeTransfers);
+        });
+      });
 
-            console.log('[WebRTC] Gathering ICE candidates...');
-            await new Promise<void>((resolve) => {
-              if (pc.iceGatheringState === 'complete') resolve();
-              else {
-                pc.iceGatheringStateChange.subscribe(state => {
-                  if (state === 'complete') resolve();
-                });
-              }
-            });
+      let disconnectTimer: NodeJS.Timeout | undefined;
+      pc.iceConnectionStateChange.subscribe((state) => {
+        console.log(`[WebRTC] Connection state (${docId}): ${state}`);
+        if (state === 'connected' || state === 'completed') {
+          if (disconnectTimer) {
+            clearTimeout(disconnectTimer);
+            disconnectTimer = undefined;
+          }
+        } else if (state === 'disconnected') {
+          if (!disconnectTimer) {
+            disconnectTimer = setTimeout(() => {
+              console.log(`[WebRTC] ICE connection remained disconnected for 5s (${docId}), closing`);
+              pc.close();
+            }, 5000);
+          }
+        } else if (state === 'failed') {
+          if (disconnectTimer) clearTimeout(disconnectTimer);
+          pc.close();
+        }
+      });
 
-            const finalAnswer = pc.localDescription;
-            if (!finalAnswer) throw new Error('Failed to get local description');
+      await pc.setRemoteDescription(new RTCSessionDescription(offerData.sdp, offerData.type));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
 
-            await restCommit([{
-              update: {
-                name: docName(`daemon_connections/${docId}`),
-                fields: {
-                  status: { stringValue: 'answer' },
-                  answer: {
-                    mapValue: {
-                      fields: {
-                        type: { stringValue: finalAnswer.type },
-                        sdp: { stringValue: finalAnswer.sdp },
-                      },
-                    },
+      console.log(`[WebRTC] Gathering ICE candidates (${docId})...`);
+      await new Promise<void>((resolve) => {
+        if (pc.iceGatheringState === 'complete') {
+          resolve();
+          return;
+        }
+        let resolved = false;
+        const timer = setTimeout(() => {
+          if (!resolved) {
+            resolved = true;
+            console.log(`[WebRTC] ICE gathering timed out after 3s (${docId}), proceeding with available candidates`);
+            resolve();
+          }
+        }, 3000);
+        const sub = pc.iceGatheringStateChange.subscribe((state) => {
+          if (state === 'complete' && !resolved) {
+            resolved = true;
+            clearTimeout(timer);
+            sub?.unSubscribe?.();
+            resolve();
+          }
+        });
+      });
+
+      const finalAnswer = pc.localDescription;
+      if (!finalAnswer) throw new Error('Failed to get local description');
+
+      await restCommit([
+        {
+          update: {
+            name: docName(`daemon_connections/${docId}`),
+            fields: {
+              status: { stringValue: 'answer' },
+              answer: {
+                mapValue: {
+                  fields: {
+                    type: { stringValue: finalAnswer.type },
+                    sdp: { stringValue: finalAnswer.sdp },
                   },
                 },
               },
-            }]);
-            console.log('[WebRTC] Answer sent to Firestore');
-          } catch (error) {
-            console.error('[WebRTC] Failed to handle offer:', error);
+            },
+          },
+        },
+      ]);
+      console.log(`[WebRTC] Answer sent to Firestore for ${docId}`);
+    } catch (error) {
+      console.error(`[WebRTC] Failed to handle offer ${docId}:`, error);
+      try {
+        await restCommit([
+          {
+            update: {
+              name: docName(`daemon_connections/${docId}`),
+              fields: { status: { stringValue: 'error' } },
+            },
+          },
+        ]);
+      } catch {}
+    } finally {
+      inFlightOffers.delete(docId);
+    }
+  };
+
+  unsubConnections = onSnapshot(
+    q,
+    (snapshot) => {
+      // #region agent log
+      __agentDebugLog(
+        'run2',
+        'H1',
+        'void_server/src/network/webrtc.ts:onSnapshot-offers',
+        'Offer snapshot update',
+        {
+          daemonId,
+          changes: snapshot.docChanges().map((c) => ({
+            type: c.type,
+            id: c.doc.id,
+            status: c.doc.data()?.status,
+          })),
+        }
+      );
+      // #endregion
+      for (const change of snapshot.docChanges()) {
+        if (change.type === 'added' || change.type === 'modified') {
+          const data = change.doc.data();
+          const docId = change.doc.id;
+
+          if (data.offer && data.status === 'offer') {
+            void handleIncomingOffer(docId, data);
           }
         }
       }
+    },
+    (err) => {
+      console.error('[WebRTC] Offers query onSnapshot error:', err?.message || err);
     }
-  }, (err) => {
-    console.error('[WebRTC] Offers query onSnapshot error:', err?.message || err);
-  });
+  );
 
   return () => {
     teardown();
