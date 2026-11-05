@@ -1,2 +1,2 @@
 /** Keep in sync with package.json `"version"`. */
-export const DAEMON_VERSION = '0.1.8';
+export const DAEMON_VERSION = '0.1.9';
