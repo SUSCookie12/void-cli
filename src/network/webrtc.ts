@@ -296,28 +296,13 @@ function updateBackupState(
 
 
 function __agentDebugLog(
-  runId: string,
-  hypothesisId: string,
-  location: string,
-  message: string,
-  data: Record<string, unknown>
+  _runId: string,
+  _hypothesisId: string,
+  _location: string,
+  _message: string,
+  _data: Record<string, unknown>
 ) {
-  fetch('http://127.0.0.1:7682/ingest/c404c6bb-707c-4b12-a2d4-6585416bd364', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Debug-Session-Id': 'e1600b'
-    },
-    body: JSON.stringify({
-      sessionId: 'e1600b',
-      runId,
-      hypothesisId,
-      location,
-      message,
-      data,
-      timestamp: Date.now()
-    })
-  }).catch(() => {});
+  // Debug endpoint removed for production security
 }
 
 async function performUpdateCli() {
