@@ -2,7 +2,8 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { getServerDir } from '../utils/paths.js';
+import { getServerDir, getVoidDir } from '../utils/paths.js';
+import { getServerMeta } from './manager.js';
 import { getPidCpuMemory } from '../utils/pidStats.js';
 import type { ServerMeta } from './manager.js';
 import { analyzeLogs, getLatestCrashReport, type CrashAnalysis } from './crashAnalyzer.js';
@@ -111,6 +112,7 @@ interface ServerInstance {
   startTime: Date;
   status: ServerStatus;
   restartPending?: boolean;
+  userInitiatedStop?: boolean;
   onlinePlayers: Set<string>;
 }
 
@@ -259,6 +261,93 @@ function parseLevel(line: string): LogLevel {
   if (/\/ERROR|ERROR\]|Exception|Caused by/.test(line)) return 'error';
   if (/\/INFO|INFO\]/.test(line)) return 'info';
   return 'info';
+}
+
+
+// --- Crash Recovery & Watchdog ---
+const crashHistory = new Map<string, number[]>();
+
+function getActiveServersFilePath(): string {
+  return path.join(getVoidDir(), 'active_servers.json');
+}
+
+export function saveActiveServer(name: string): void {
+  try {
+    const filePath = getActiveServersFilePath();
+    let list: string[] = [];
+    if (fs.existsSync(filePath)) {
+      list = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    }
+    if (!list.includes(name)) {
+      list.push(name);
+      fs.writeFileSync(filePath, JSON.stringify(list, null, 2));
+    }
+  } catch {}
+}
+
+export function removeActiveServer(name: string): void {
+  try {
+    const filePath = getActiveServersFilePath();
+    if (fs.existsSync(filePath)) {
+      const list: string[] = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      const updated = list.filter(n => n !== name);
+      fs.writeFileSync(filePath, JSON.stringify(updated, null, 2));
+    }
+  } catch {}
+}
+
+export function clearActiveServers(): void {
+  try {
+    const filePath = getActiveServersFilePath();
+    fs.writeFileSync(filePath, JSON.stringify([], null, 2));
+  } catch {}
+}
+
+export async function restoreActiveServersOnBoot(): Promise<void> {
+  try {
+    const filePath = getActiveServersFilePath();
+    if (!fs.existsSync(filePath)) return;
+    const list: string[] = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    if (!Array.isArray(list) || list.length === 0) return;
+
+    console.log(`[VOID Watchdog] Found ${list.length} server(s) active prior to restart. Restoring...`);
+    for (const name of list) {
+      const meta = getServerMeta(name);
+      if (meta && !instances.has(name)) {
+        console.log(`[VOID Watchdog] Auto-recovering server: ${name}`);
+        try {
+          await startServer(meta);
+        } catch (err: any) {
+          console.error(`[VOID Watchdog] Failed to auto-recover ${name}:`, err.message);
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn('[VOID Watchdog] Notice during active server restore:', err?.message || err);
+  }
+}
+
+function handleUnexpectedCrash(
+  meta: ServerMeta,
+  code: number | null,
+  addLog: (text: string, level?: LogLevel) => void
+): void {
+  const now = Date.now();
+  const history = (crashHistory.get(meta.name) || []).filter(t => now - t < 300000); // 5 minute window
+  history.push(now);
+  crashHistory.set(meta.name, history);
+
+  if (history.length <= 3) {
+    addLog(`[VOID Watchdog] Unexpected exit (code ${code ?? 'unknown'}). Auto-recovering in 3s (attempt ${history.length}/3 in 5m)...`, 'warn');
+    setTimeout(() => {
+      if (!isShuttingDown && !instances.has(meta.name)) {
+        addLog(`[VOID Watchdog] Executing auto-restart for ${meta.name}...`, 'system');
+        void startServer(meta);
+      }
+    }, 3000);
+  } else {
+    addLog(`[VOID Watchdog] Crash loop prevented: ${meta.name} crashed 3 times within 5 minutes. Auto-recovery paused to protect system resources.`, 'error');
+  }
 }
 
 export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => void): Promise<void> {
@@ -613,4 +702,5 @@ export async function stopAllServers(): Promise<void> {
   });
 
   await Promise.all(stops);
+  clearActiveServers();
 }

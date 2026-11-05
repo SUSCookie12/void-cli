@@ -7,6 +7,7 @@ import { ServerDetailScreen } from './screens/ServerDetailScreen.js';
 import { DaemonConsoleBox } from './components/DaemonConsoleBox.js';
 import { loadSession, clearSession, type UserSession } from '../auth/session.js';
 import { getServerMeta } from '../server/manager.js';
+import { restoreActiveServersOnBoot } from '../server/instance.js';
 import { initWebRTCSignaling } from '../network/webrtc.js';
 import { registerSessionRevokedHandler } from '../auth/sessionEvents.js';
 import { setupTuiLogger, restoreConsoleLogger } from '../utils/activityLogger.js';
@@ -139,6 +140,9 @@ function initializeLogic() {
   } else {
     console.warn('[VOID] No active session found. WebRTC signaling will not start until authenticated.');
   }
+
+  // Restore any servers that were active before an unexpected daemon restart or crash
+  void restoreActiveServersOnBoot();
 }
 
 export function startUI(): void {
