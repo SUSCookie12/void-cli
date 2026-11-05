@@ -2,6 +2,7 @@ import { Worker } from 'node:worker_threads';
 import fs from 'node:fs';
 import path from 'node:path';
 import * as tar from 'tar';
+// @ts-ignore
 import archiver from 'archiver';
 import extract from 'extract-zip';
 

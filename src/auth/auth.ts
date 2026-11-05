@@ -1,4 +1,4 @@
-import { onSnapshot } from 'firebase/firestore';
+import { onSnapshot, doc, type DocumentSnapshot } from 'firebase/firestore';
 import { v4 as uuidv4 } from 'uuid';
 import { getDb } from '../config/firebase.js';
 import { getDaemonId } from './session.js';
@@ -65,7 +65,7 @@ export async function startAuthFlow(
 
     const unsubscribe = onSnapshot(
       doc(db, 'login_tokens', sessionId),
-      async snapshot => {
+      async (snapshot: any) => {
         const data = snapshot.data();
         if (!data) return;
 
@@ -104,7 +104,7 @@ export async function startAuthFlow(
           reject(new Error('Authentication was rejected by the server.'));
         }
       },
-      error => {
+      (error: any) => {
         clearTimeout(timeoutId);
         reject(new Error(`Firestore listener error: ${error.message}`));
       }

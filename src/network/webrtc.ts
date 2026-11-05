@@ -2248,7 +2248,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
         try {
           let targetDir: string;
-          let finalNewName: string | undefined;
+          let finalNewName: string = '';
           let archivedServerName: string | undefined;
 
           // Stop server if currently running
@@ -2925,7 +2925,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           if (meta.type === 'vanilla') {
             throw new Error('Spark requires a plugin or mod loader (Paper, Purpur, Fabric, Forge, NeoForge, or Quilt). Vanilla does not support plugins or mods.');
           }
-          const isPlugin = meta.type === 'paper' || meta.type === 'purpur' || meta.type === 'spigot';
+          const isPlugin = meta.type === 'paper' || meta.type === 'purpur';
           const targetFolder = isPlugin
             ? path.join(getServerDir(server), 'plugins')
             : path.join(getServerDir(server), 'mods');
