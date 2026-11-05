@@ -32,6 +32,7 @@ jobs:
         working-directory: .
         run: |
           npm install
+          node patch-deps.cjs
           npm run package:all
 
       - name: Publish GitHub Release assets

@@ -6,6 +6,7 @@
   "main": "dist/bundle.cjs",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "postinstall": "node patch-deps.cjs",
     "build": "esbuild src/index.ts --bundle --platform=node --target=node18 --format=cjs --external:fsevents --alias:react-devtools-core=./src/stubs/react-devtools-core.ts --alias:yoga-wasm-web/auto=./src/shims/yoga-wasm-auto.ts --outfile=dist/bundle.cjs",
     "package:win": "pkg . --targets node18-win-x64 --output dist/voidmc.exe --compress GZip --public",
     "package:linux": "pkg . --targets node18-linux-x64 --output dist/voidmc-linux --compress GZip --public",
