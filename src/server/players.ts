@@ -36,22 +36,26 @@ export async function getPlayerLists(serverName: string): Promise<PlayerLists> {
   const whitelistRaw = await readJson('whitelist.json');
   const bannedRaw = await readJson('banned-players.json');
   const cacheRaw = await readJson('usercache.json');
+  const allowlistRaw = await readJson('allowlist.json');
+  const permissionsRaw = await readJson('permissions.json');
 
   const ensureArray = (val: any) => Array.isArray(val) ? val : [];
+  const mergedWhitelist = ensureArray(whitelistRaw).length > 0
+    ? ensureArray(whitelistRaw).map((p: any) => ({ uuid: p?.uuid || '', name: p?.name || '' }))
+    : ensureArray(allowlistRaw).map((p: any) => ({ uuid: p?.xuid || '', name: p?.name || '' }));
+  const mergedOps = ensureArray(opsRaw).length > 0
+    ? ensureArray(opsRaw).map((p: any) => ({ uuid: p?.uuid || '', name: p?.name || '' }))
+    : ensureArray(permissionsRaw)
+        .filter((p: any) => p?.permission === 'operator')
+        .map((p: any) => ({ uuid: p?.xuid || '', name: p?.xuid || 'Operator' }));
 
   return {
     all: ensureArray(cacheRaw).map((p: any) => ({ 
       uuid: p?.uuid || '', 
       name: p?.name || 'Unknown Player' 
     })),
-    ops: ensureArray(opsRaw).map((p: any) => ({ 
-      uuid: p?.uuid || '', 
-      name: p?.name || '' 
-    })),
-    whitelist: ensureArray(whitelistRaw).map((p: any) => ({ 
-      uuid: p?.uuid || '', 
-      name: p?.name || '' 
-    })),
+    ops: mergedOps,
+    whitelist: mergedWhitelist,
     banned: ensureArray(bannedRaw).map((p: any) => ({ 
       uuid: p?.uuid || '', 
       name: p?.name || '',

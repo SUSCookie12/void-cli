@@ -1,112 +1,105 @@
-import { CLOUDFLARE_API_TOKEN, CLOUDFLARE_ZONE_ID, VOID_DOMAIN } from '../config/dns.js';
+import {
+  CLOUDFLARE_CONFIG,
+  VOID_DOMAIN,
+  VOID_DNS_API_URL,
+  isDirectCloudflareConfigured,
+} from '../config/dns.js';
+import { loadSession } from '../auth/session.js';
+import { containsDisallowedWords } from '../utils/subdomainFilter.js';
 
 const CF_API = 'https://api.cloudflare.com/client/v4';
 
 interface CloudflareResponse {
   success: boolean;
-  errors: { message: string }[];
+  errors?: { message: string }[];
   result?: any;
 }
 
-async function cfRequest(method: string, path: string, body?: object): Promise<CloudflareResponse> {
-  const res = await fetch(`${CF_API}${path}`, {
+export interface DnsRegistrationResult {
+  domain: string;
+  subdomain: string;
+  resolvedCollision?: boolean;
+}
+
+async function cfRequest(method: string, endpoint: string, body?: object): Promise<CloudflareResponse> {
+  const res = await fetch(`${CF_API}${endpoint}`, {
     method,
     headers: {
-      'Authorization': `Bearer ${CLOUDFLARE_API_TOKEN}`,
+      Authorization: `Bearer ${CLOUDFLARE_CONFIG.apiToken}`,
       'Content-Type': 'application/json',
     },
     body: body ? JSON.stringify(body) : undefined,
   });
-  return res.json() as Promise<CloudflareResponse>;
+  return (await res.json()) as CloudflareResponse;
 }
 
 /**
- * Finds existing DNS records for a given server subdomain.
- * Returns a list of record IDs so we can delete them.
+ * Registers a direct connection (UPnP / Port Forwarded) on `<subdomain>.void.borgov.dev`
  */
-async function findRecords(subdomain: string): Promise<string[]> {
-  const fullDomain = `${subdomain}.${VOID_DOMAIN}`;
-  const res = await cfRequest('GET', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records?name=${fullDomain}`);
-  if (!res.success || !res.result) return [];
-  return res.result.map((r: any) => r.id);
-}
+export async function registerDirectDns(
+  subdomain: string,
+  ip: string,
+  port: number,
+  serverName?: string
+): Promise<DnsRegistrationResult> {
+  const cleanSub = subdomain.trim().toLowerCase();
+  if (!isValidSubdomain(cleanSub)) {
+    throw new Error(`Invalid or disallowed subdomain: "${cleanSub}"`);
+  }
+  const fullDomain = `${cleanSub}.${VOID_DOMAIN}`;
 
-/**
- * Creates or updates DNS records for a server tunnel.
- * subdomain: the user-chosen ID (e.g. "survival")
- * playitHost: the playit.gg hostname (e.g. "auto.playit.gg" or "abc.joinmc.link")
- * port: the port assigned by playit.gg
- */
-export async function registerTunnelDns(subdomain: string, playitHost: string, port: number): Promise<string> {
-  const fullDomain = `${subdomain}.${VOID_DOMAIN}`;
-  console.log(`[DNS] Registering ${fullDomain} → ${playitHost}:${port}`);
-
-  // Delete any existing records first (clean slate on re-register)
-  await deleteTunnelDns(subdomain);
-
-  // 1. CNAME record: survival.void.cspack.online → playit host
-  const cnameRes = await cfRequest('POST', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records`, {
-    type: 'CNAME',
-    name: fullDomain,
-    content: playitHost,
-    ttl: 1, // Auto TTL
-    proxied: false, // Must be false for game servers (non-HTTP traffic)
-  });
-
-  if (!cnameRes.success) {
-    throw new Error(`CNAME creation failed: ${cnameRes.errors.map(e => e.message).join(', ')}`);
+  // 1. Prefer autonomous Void DNS Broker API using daemon session
+  const session = loadSession();
+  if (session?.uid && session?.daemonId && !isDirectCloudflareConfigured()) {
+    try {
+      const res = await fetch(VOID_DNS_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action: 'register_direct',
+          uid: session.uid,
+          daemonId: session.daemonId,
+          subdomain: cleanSub,
+          ip,
+          port,
+          serverName,
+        }),
+      });
+      const data = (await res.json()) as any;
+      if (data?.success && data?.domain) {
+        return {
+          domain: data.domain,
+          subdomain: data.subdomain || cleanSub,
+          resolvedCollision: Boolean(data.resolvedCollision),
+        };
+      }
+    } catch {
+      // Fallback below if broker is unreachable
+    }
   }
 
-  // 2. SRV record: so players don't need to type the port
-  // Format: _minecraft._tcp.survival.void.cspack.online
-  const srvRes = await cfRequest('POST', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records`, {
-    type: 'SRV',
-    name: `_minecraft._tcp.${fullDomain}`,
-    data: {
-      service: '_minecraft',
-      proto: '_tcp',
-      name: fullDomain,
-      priority: 0,
-      weight: 5,
-      port: port,
-      target: playitHost,
-    },
-    ttl: 1,
-  });
-
-  if (!srvRes.success) {
-    console.warn(`[DNS] SRV creation warning: ${srvRes.errors.map(e => e.message).join(', ')}`);
-    // Non-fatal: CNAME works, players just need to include port
+  // 2. Optional direct Cloudflare API fallback if local env vars are set
+  if (!isDirectCloudflareConfigured()) {
+    return { domain: fullDomain, subdomain: cleanSub };
   }
 
-  console.log(`[DNS] ✓ ${fullDomain} registered (via Tunnel)`);
-  return fullDomain;
-}
+  await deleteTunnelDns(cleanSub);
 
-/**
- * Creates or updates DNS records for a DIRECT connection (no tunnel).
- */
-export async function registerDirectDns(subdomain: string, ip: string, port: number): Promise<string> {
-  const fullDomain = `${subdomain}.${VOID_DOMAIN}`;
-  console.log(`[DNS] Registering ${fullDomain} → ${ip}:${port} (Direct)`);
-
-  await deleteTunnelDns(subdomain);
-
-  // 1. A record: survival.void.cspack.online → Public IP
-  const aRes = await cfRequest('POST', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records`, {
+  const aRes = await cfRequest('POST', `/zones/${CLOUDFLARE_CONFIG.zoneId}/dns_records`, {
     type: 'A',
     name: fullDomain,
     content: ip,
-    ttl: 1,
+    ttl: 60,
     proxied: false,
   });
 
   if (!aRes.success) {
-    throw new Error(`A record creation failed: ${aRes.errors.map(e => e.message).join(', ')}`);
+    throw new Error(`A record creation failed: ${(aRes.errors || []).map((e) => e.message).join(', ')}`);
   }
 
-  // 2. SRV record
-  const srvRes = await cfRequest('POST', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records`, {
+  await cfRequest('POST', `/zones/${CLOUDFLARE_CONFIG.zoneId}/dns_records`, {
     type: 'SRV',
     name: `_minecraft._tcp.${fullDomain}`,
     data: {
@@ -115,47 +108,184 @@ export async function registerDirectDns(subdomain: string, ip: string, port: num
       name: fullDomain,
       priority: 0,
       weight: 5,
-      port: port,
+      port,
       target: fullDomain,
     },
-    ttl: 1,
+    ttl: 60,
+  });
+
+  return { domain: fullDomain, subdomain: cleanSub };
+}
+
+/**
+ * Registers a tunnel connection (Playit.gg) on `<subdomain>.void.borgov.dev`
+ * Creates `_minecraft._tcp.<subdomain>.void.borgov.dev` SRV -> `targetHost:port`
+ */
+export async function registerTunnelDns(
+  subdomain: string,
+  targetHost: string,
+  port: number,
+  serverName?: string
+): Promise<DnsRegistrationResult> {
+  const cleanSub = subdomain.trim().toLowerCase();
+  if (!isValidSubdomain(cleanSub)) {
+    throw new Error(`Invalid or disallowed subdomain: "${cleanSub}"`);
+  }
+  const fullDomain = `${cleanSub}.${VOID_DOMAIN}`;
+
+  // 1. Prefer autonomous Void DNS Broker API using daemon session
+  const session = loadSession();
+  if (session?.uid && session?.daemonId && !isDirectCloudflareConfigured()) {
+    try {
+      const res = await fetch(VOID_DNS_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action: 'register_tunnel',
+          uid: session.uid,
+          daemonId: session.daemonId,
+          subdomain: cleanSub,
+          targetHost,
+          port,
+          serverName,
+        }),
+      });
+      const data = (await res.json()) as any;
+      if (data?.success && data?.domain) {
+        return {
+          domain: data.domain,
+          subdomain: data.subdomain || cleanSub,
+          resolvedCollision: Boolean(data.resolvedCollision),
+        };
+      }
+    } catch {
+      // Fallback below if broker is unreachable
+    }
+  }
+
+  // 2. Optional direct Cloudflare API fallback if local env vars are set
+  if (!isDirectCloudflareConfigured()) {
+    return { domain: fullDomain, subdomain: cleanSub };
+  }
+
+  await deleteTunnelDns(cleanSub);
+
+  await cfRequest('POST', `/zones/${CLOUDFLARE_CONFIG.zoneId}/dns_records`, {
+    type: 'CNAME',
+    name: fullDomain,
+    content: targetHost,
+    ttl: 60,
+    proxied: false,
+  });
+
+  const srvRes = await cfRequest('POST', `/zones/${CLOUDFLARE_CONFIG.zoneId}/dns_records`, {
+    type: 'SRV',
+    name: `_minecraft._tcp.${fullDomain}`,
+    data: {
+      service: '_minecraft',
+      proto: '_tcp',
+      name: fullDomain,
+      priority: 0,
+      weight: 5,
+      port,
+      target: targetHost,
+    },
+    ttl: 60,
   });
 
   if (!srvRes.success) {
-    console.warn(`[DNS] SRV creation warning: ${srvRes.errors.map(e => e.message).join(', ')}`);
+    throw new Error(`SRV creation failed: ${(srvRes.errors || []).map((e) => e.message).join(', ')}`);
   }
 
-  console.log(`[DNS] ✓ ${fullDomain} registered (Direct IP: ${ip})`);
-  return fullDomain;
+  return { domain: fullDomain, subdomain: cleanSub };
 }
 
 /**
- * Removes all DNS records for a server subdomain.
- * Called when a server is deleted.
+ * Deletes existing DNS records for `<subdomain>.void.borgov.dev`
  */
 export async function deleteTunnelDns(subdomain: string): Promise<void> {
-  const records = await findRecords(subdomain);
+  const cleanSub = (subdomain || '').trim().toLowerCase();
+  if (!cleanSub) return;
 
-  // Also check for SRV records
-  const srvFullDomain = `_minecraft._tcp.${subdomain}.${VOID_DOMAIN}`;
-  const srvRes = await cfRequest('GET', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records?name=${srvFullDomain}`);
-  if (srvRes.success && srvRes.result) {
-    records.push(...srvRes.result.map((r: any) => r.id));
+  const session = loadSession();
+  if (session?.uid && session?.daemonId && !isDirectCloudflareConfigured()) {
+    try {
+      await fetch(VOID_DNS_API_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          action: 'delete',
+          uid: session.uid,
+          daemonId: session.daemonId,
+          subdomain: cleanSub,
+        }),
+      });
+      return;
+    } catch {
+      // Ignore cleanup errors
+    }
   }
 
-  for (const id of records) {
-    await cfRequest('DELETE', `/zones/${CLOUDFLARE_ZONE_ID}/dns_records/${id}`);
-    console.log(`[DNS] Deleted record ${id}`);
-  }
+  if (!isDirectCloudflareConfigured()) return;
 
-  if (records.length > 0) {
-    console.log(`[DNS] ✓ Cleaned up ${records.length} record(s) for ${subdomain}.${VOID_DOMAIN}`);
+  const fullDomain = `${cleanSub}.${VOID_DOMAIN}`;
+  const srvDomain = `_minecraft._tcp.${fullDomain}`;
+
+  try {
+    for (const name of [fullDomain, srvDomain]) {
+      const listRes = await cfRequest('GET', `/zones/${CLOUDFLARE_CONFIG.zoneId}/dns_records?name=${encodeURIComponent(name)}`);
+      if (listRes.success && Array.isArray(listRes.result)) {
+        for (const rec of listRes.result) {
+          await cfRequest('DELETE', `/zones/${CLOUDFLARE_CONFIG.zoneId}/dns_records/${rec.id}`);
+        }
+      }
+    }
+  } catch {
+    // Ignore cleanup errors
   }
 }
 
+export const cleanupDns = deleteTunnelDns;
+
 /**
- * Validates that a subdomain is safe to use (alphanumeric + hyphens only)
+ * Sends a heartbeat ping to renew the 5-minute Dead-Man's Switch lease on Cloudflare DNS
  */
+export async function sendDnsHeartbeat(subdomain: string, serverName?: string): Promise<boolean> {
+  const cleanSub = (subdomain || '').trim().toLowerCase();
+  if (!cleanSub) return false;
+
+  const session = loadSession();
+  if (!session?.uid || !session?.daemonId || isDirectCloudflareConfigured()) {
+    return false;
+  }
+
+  try {
+    const res = await fetch(VOID_DNS_API_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        action: 'heartbeat',
+        uid: session.uid,
+        daemonId: session.daemonId,
+        subdomain: cleanSub,
+        serverName,
+      }),
+    });
+    const data = (await res.json()) as any;
+    return Boolean(data?.success);
+  } catch {
+    return false;
+  }
+}
+
 export function isValidSubdomain(sub: string): boolean {
-  return /^[a-z0-9][a-z0-9-]{1,30}[a-z0-9]$/.test(sub);
+  if (!sub || sub.length < 3 || sub.length > 48) return false;
+  if (!/^[a-z0-9][a-z0-9-]{1,46}[a-z0-9]$/.test(sub)) return false;
+  return !containsDisallowedWords(sub);
 }

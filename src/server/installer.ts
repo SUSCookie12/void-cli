@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createWriteStream } from 'node:fs';
 import { spawnSync, type SpawnSyncReturns } from 'node:child_process';
-import { getServerDir } from '../utils/paths.js';
+import { getServerDir, getLocalBackupsDir } from '../utils/paths.js';
 import { getVanillaServerUrl } from '../api/mojang.js';
 import { getLatestPaperInfo } from '../api/paper.js';
 import { getLatestStableFabricInstaller, getLatestStableLoaderForGame } from '../api/fabric.js';
@@ -11,12 +11,14 @@ import { getLatestPurpurBuild } from '../api/purpur.js';
 import { getNeoForgeInstallerInfo } from '../api/neoforge.js';
 import { getQuiltInstallerInfo } from '../api/quilt.js';
 import { getArclightDownloadInfo } from '../api/arclight.js';
+import { getBedrockDownloadInfo } from '../api/bedrock.js';
 import { detectJava, getRequiredJava } from '../utils/java.js';
 import { downloadFile } from '../utils/download.js';
 export { downloadFile };
-import { saveServerMeta, getNextAvailablePort } from './manager.js';
-import { listServerJarsInDir } from './instance.js';
-import { extractArchive } from '../utils/zipper.js';
+import { getServerMeta, saveServerMeta, getNextAvailablePort, listServers, slugifyServerName } from './manager.js';
+import { generateRandomSubdomain } from '../utils/wordGenerator.js';
+import { listServerJarsInDir, isRunning, stopServer, waitForServerStop } from './instance.js';
+import { extractArchive, compressFolder } from '../utils/zipper.js';
 import type { ServerMeta } from './manager.js';
 
 export interface InstallProgress {
@@ -366,6 +368,31 @@ export async function installServer(
           message: `Downloading Arclight ${meta.version}... ${pct}%`,
         });
       });
+    } else if (meta.type === 'bedrock') {
+      const info = await getBedrockDownloadInfo(meta.version);
+      meta.version = info.version;
+      const zipPath = path.join(serverDir, `bedrock-server-${info.version}.zip`);
+
+      onProgress({ stage: 'downloading', progress: 10, message: `Downloading Bedrock Dedicated Server ${info.version}...` });
+      await downloadFile(info.url, zipPath, pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(10 + pct * 0.65),
+          message: `Downloading Bedrock ${info.version}... ${pct}%`,
+        });
+      });
+
+      onProgress({ stage: 'downloading', progress: 78, message: 'Extracting Bedrock Dedicated Server archive...' });
+      await extractArchive(zipPath, serverDir);
+      try { fs.unlinkSync(zipPath); } catch {}
+
+      if (process.platform !== 'win32') {
+        const binPath = path.join(serverDir, 'bedrock_server');
+        if (fs.existsSync(binPath)) {
+          try { fs.chmodSync(binPath, 0o755); } catch {}
+        }
+      }
+      meta.launchJar = process.platform === 'win32' ? 'bedrock_server.exe' : 'bedrock_server';
     } else {
       let downloadUrl: string;
       if (meta.type === 'vanilla') {
@@ -390,44 +417,113 @@ export async function installServer(
     }
 
     // 4. Configure
-    onProgress({ stage: 'configuring', progress: 94, message: 'Writing configuration...' });
+    onProgress({ stage: 'configuring', progress: 92, message: 'Writing configuration...' });
 
-    // EULA — set to false by default, user must accept via UI
-    fs.writeFileSync(path.join(serverDir, 'eula.txt'), '#Set by Void Server\neula=false\n');
-
-    // Default server.properties merged with any pre-configured properties
-    const defaultProps: Record<string, string> = {
-      'server-port': String(meta.port),
-      'online-mode': 'true',
-      'max-players': '20',
-      'view-distance': '10',
-      'simulation-distance': '10',
-      'level-name': 'world',
-      'level-seed': '',
-      'level-type': 'default',
-      'generate-structures': 'true',
-      'allow-nether': 'true',
-      'hardcore': 'false',
-      'motd': `\\u00A76\\u00A7l${meta.name}\\u00A7r \\u00A77| Void Server`,
-      'enable-command-block': 'false',
-      'spawn-protection': '16',
-      'difficulty': 'normal',
-      'gamemode': 'survival',
-      'pvp': 'true',
-    };
-    if (meta.initialProperties && typeof meta.initialProperties === 'object') {
-      for (const [k, v] of Object.entries(meta.initialProperties)) {
-        if (v !== undefined && v !== null) {
-          defaultProps[k] = String(v);
-        }
+    // Optional Preset Post-Install (e.g. GeyserMC Cross-Play: Paper + Geyser-Spigot + Floodgate)
+    if (meta.preset === 'geysermc' && meta.type !== 'bedrock') {
+      const pluginsDir = path.join(serverDir, 'plugins');
+      if (!fs.existsSync(pluginsDir)) fs.mkdirSync(pluginsDir, { recursive: true });
+      try {
+        onProgress({ stage: 'configuring', progress: 93, message: 'Installing GeyserMC plugin for Bedrock cross-play...' });
+        await downloadFile(
+          'https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot',
+          path.join(pluginsDir, 'Geyser-Spigot.jar')
+        );
+        onProgress({ stage: 'configuring', progress: 96, message: 'Installing Floodgate plugin (no Java account required)...' });
+        await downloadFile(
+          'https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot',
+          path.join(pluginsDir, 'floodgate-spigot.jar')
+        );
+      } catch (presetErr: any) {
+        console.warn('[Installer] GeyserMC preset plugin download warning:', presetErr?.message || presetErr);
       }
     }
-    const propLines = Object.entries(defaultProps)
-      .map(([k, v]) => `${k}=${v}`)
-      .join('\n');
-    fs.writeFileSync(path.join(serverDir, 'server.properties'), propLines + '\n');
 
-    // Save metadata
+    if (meta.type === 'bedrock') {
+      // Merge desired port/name/settings into Bedrock's extracted server.properties
+      const propsPath = path.join(serverDir, 'server.properties');
+      const overrides: Record<string, string> = {
+        'server-name': meta.name,
+        'server-port': String(meta.port || 19132),
+        'server-portv6': String((meta.port || 19132) + 1),
+        'level-name': 'Bedrock level',
+      };
+      if (meta.initialProperties && typeof meta.initialProperties === 'object') {
+        for (const [k, v] of Object.entries(meta.initialProperties)) {
+          if (v !== undefined && v !== null) overrides[k] = String(v);
+        }
+      }
+      if (fs.existsSync(propsPath)) {
+        const existing = fs.readFileSync(propsPath, 'utf-8').split(/\r?\n/);
+        const applied = new Set<string>();
+        const updated = existing.map(line => {
+          const trimmed = line.trim();
+          if (!trimmed || trimmed.startsWith('#')) return line;
+          const eq = line.indexOf('=');
+          if (eq === -1) return line;
+          const key = line.slice(0, eq).trim();
+          if (key in overrides) {
+            applied.add(key);
+            return `${key}=${overrides[key]}`;
+          }
+          return line;
+        });
+        for (const [k, v] of Object.entries(overrides)) {
+          if (!applied.has(k)) updated.push(`${k}=${v}`);
+        }
+        fs.writeFileSync(propsPath, updated.join('\n') + '\n');
+      } else {
+        fs.writeFileSync(
+          propsPath,
+          Object.entries(overrides).map(([k, v]) => `${k}=${v}`).join('\n') + '\n'
+        );
+      }
+    } else {
+      // EULA — set to false by default, user must accept via UI
+      fs.writeFileSync(path.join(serverDir, 'eula.txt'), '#Set by Void Server\neula=false\n');
+
+      // Default server.properties merged with any pre-configured properties
+      const defaultProps: Record<string, string> = {
+        'server-port': String(meta.port),
+        'online-mode': 'true',
+        'max-players': '20',
+        'view-distance': '10',
+        'simulation-distance': '10',
+        'level-name': 'world',
+        'level-seed': '',
+        'level-type': 'default',
+        'generate-structures': 'true',
+        'allow-nether': 'true',
+        'hardcore': 'false',
+        'motd': `\\u00A76\\u00A7l${meta.name}\\u00A7r \\u00A77| Void Server`,
+        'enable-command-block': 'false',
+        'spawn-protection': '16',
+        'difficulty': 'normal',
+        'gamemode': 'survival',
+        'pvp': 'true',
+      };
+      if (meta.initialProperties && typeof meta.initialProperties === 'object') {
+        for (const [k, v] of Object.entries(meta.initialProperties)) {
+          if (v !== undefined && v !== null) {
+            defaultProps[k] = String(v);
+          }
+        }
+      }
+      const propLines = Object.entries(defaultProps)
+        .map(([k, v]) => `${k}=${v}`)
+        .join('\n');
+      fs.writeFileSync(path.join(serverDir, 'server.properties'), propLines + '\n');
+    }
+
+    // Save metadata (ensure random subdomain & autoExpose defaults)
+    if (!meta.subdomain) {
+      const existingSubs = new Set(listServers().map(s => s.subdomain).filter(Boolean) as string[]);
+      meta.subdomain = generateRandomSubdomain(existingSubs);
+    }
+    meta.statusId = slugifyServerName(meta.name);
+    if (meta.autoExpose === undefined) {
+      meta.autoExpose = true;
+    }
     saveServerMeta(meta);
 
     onProgress({ stage: 'done', progress: 100, message: 'Installation complete!' });
@@ -648,7 +744,9 @@ export async function importServerFromSource(
     const finalPort = opts.port || (!isNaN(parsedPropPort) ? parsedPropPort : getNextAvailablePort());
     const finalLaunchJar = opts.launchJar || inspection.recommendedJar || 'server.jar';
 
-    const statusId = inspection.existingMeta?.statusId || (Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10));
+    const existingSubs = new Set(listServers().map(s => s.subdomain).filter(Boolean) as string[]);
+    const assignedSubdomain = inspection.existingMeta?.subdomain || generateRandomSubdomain(existingSubs);
+    const statusId = slugifyServerName(serverName);
 
     const meta: ServerMeta = {
       name: opts.name,
@@ -660,6 +758,7 @@ export async function importServerFromSource(
       javaVersion: opts.javaVersion || inspection.existingMeta?.javaVersion,
       createdAt: new Date().toISOString(),
       statusId,
+      subdomain: assignedSubdomain,
     };
 
     // If user requested downloading a fresh server JAR or no JAR exists in the imported folder
@@ -774,12 +873,390 @@ export async function importServerFromSource(
       .join('\n');
     fs.writeFileSync(path.join(serverDir, 'server.properties'), propLines + '\n');
 
+    if (!meta.subdomain) {
+      const existingSubs = new Set(listServers().map(s => s.subdomain).filter(Boolean) as string[]);
+      meta.subdomain = generateRandomSubdomain(existingSubs);
+    }
+    meta.statusId = slugifyServerName(meta.name);
+    if (meta.autoExpose === undefined) {
+      meta.autoExpose = true;
+    }
     saveServerMeta(meta);
     onProgress({ stage: 'done', progress: 100, message: 'Server imported successfully!' });
     return meta;
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     onProgress({ stage: 'error', progress: 0, message: 'Import failed', error: message });
+    throw err;
+  }
+}
+
+export interface ReinstallOptions {
+  serverName: string;
+  type: 'paper' | 'purpur' | 'fabric' | 'vanilla' | 'forge' | 'neoforge' | 'quilt' | 'arclight' | 'bedrock';
+  version: string;
+  build?: number;
+  retentionScope?: 'in_place' | 'clean_engine' | 'fresh';
+  createBackup?: boolean;
+}
+
+export async function reinstallServer(
+  opts: ReinstallOptions,
+  onProgress: (p: InstallProgress) => void
+): Promise<ServerMeta> {
+  const { serverName, type, version, build, retentionScope = 'in_place', createBackup = true } = opts;
+  const serverDir = getServerDir(serverName);
+  const meta = getServerMeta(serverName);
+  if (!meta) {
+    throw new Error(`Server "${serverName}" does not exist`);
+  }
+
+  try {
+    // 1. Stop server if running
+    if (isRunning(serverName)) {
+      onProgress({ stage: 'creating', progress: 5, message: 'Stopping running Minecraft server...' });
+      stopServer(serverName);
+      try {
+        await waitForServerStop(serverName, 10000);
+      } catch {
+        console.warn(`[Reinstall] Graceful stop timed out for ${serverName}, continuing...`);
+      }
+    }
+
+    // 2. Safety Backup
+    if (createBackup) {
+      onProgress({ stage: 'creating', progress: 12, message: 'Creating safety backup before reinstallation...' });
+      const backupsDir = getLocalBackupsDir(serverName);
+      if (!fs.existsSync(backupsDir)) {
+        fs.mkdirSync(backupsDir, { recursive: true });
+      }
+      const backupFilename = `backup_pre_reinstall_${Date.now()}.zip`;
+      const tempBackupPath = path.join(backupsDir, `.${backupFilename}.tmp`);
+      const finalBackupPath = path.join(backupsDir, backupFilename);
+
+      await compressFolder(
+        serverDir,
+        tempBackupPath,
+        (pct) => {
+          onProgress({
+            stage: 'creating',
+            progress: Math.min(25, 12 + Math.round(pct * 0.13)),
+            message: `Creating safety backup... ${pct}%`,
+          });
+        },
+        undefined,
+        backupsDir
+      );
+
+      if (fs.existsSync(tempBackupPath)) {
+        try {
+          fs.renameSync(tempBackupPath, finalBackupPath);
+        } catch {
+          fs.copyFileSync(tempBackupPath, finalBackupPath);
+          try { fs.unlinkSync(tempBackupPath); } catch {}
+        }
+      }
+    }
+
+    // 3. Retention Scope Cleaning
+    onProgress({ stage: 'creating', progress: 28, message: `Preparing files for ${retentionScope.replace('_', ' ')}...` });
+    
+    const removeIfExists = (target: string) => {
+      try {
+        if (fs.existsSync(target)) {
+          const stat = fs.statSync(target);
+          if (stat.isDirectory()) {
+            fs.rmSync(target, { recursive: true, force: true });
+          } else {
+            fs.unlinkSync(target);
+          }
+        }
+      } catch (e) {
+        console.warn(`[Reinstall] Could not delete ${target}:`, e);
+      }
+    };
+
+    if (retentionScope === 'fresh') {
+      const entries = fs.readdirSync(serverDir);
+      for (const entry of entries) {
+        if (entry === 'backups' || entry === 'meta.json' || entry === 'void-meta.json') continue;
+        removeIfExists(path.join(serverDir, entry));
+      }
+    } else {
+      const entries = fs.readdirSync(serverDir);
+      for (const entry of entries) {
+        const lower = entry.toLowerCase();
+        if (
+          lower === 'server.jar' ||
+          lower.startsWith('paper-') ||
+          lower.startsWith('purpur-') ||
+          lower.startsWith('fabric-server-launch') ||
+          lower.startsWith('quilt-server-launch') ||
+          lower.startsWith('forge-') ||
+          lower.startsWith('neoforge-') ||
+          lower.startsWith('arclight-') ||
+          lower === 'run.bat' ||
+          lower === 'run.sh' ||
+          lower === 'user_jvm_args.txt' ||
+          lower === 'fabric-installer.jar' ||
+          lower === 'forge-installer.jar' ||
+          lower === 'neoforge-installer.jar' ||
+          lower === 'quilt-installer.jar'
+        ) {
+          removeIfExists(path.join(serverDir, entry));
+        }
+      }
+
+      if (retentionScope === 'clean_engine') {
+        removeIfExists(path.join(serverDir, 'libraries'));
+        removeIfExists(path.join(serverDir, '.fabric'));
+        removeIfExists(path.join(serverDir, '.quilt'));
+        removeIfExists(path.join(serverDir, 'cache'));
+        removeIfExists(path.join(serverDir, 'installer'));
+      }
+    }
+
+    // 4. Download and Install New Engine Files
+    onProgress({ stage: 'downloading', progress: 35, message: `Fetching ${type} ${version}...` });
+
+    meta.type = type;
+    meta.version = version;
+    if (build) {
+      meta.build = build;
+    } else {
+      delete meta.build;
+    }
+
+    let newLaunchJar: string | undefined;
+
+    if (type === 'fabric') {
+      const loaderVersion = await getLatestStableLoaderForGame(version);
+      meta.fabricLoader = loaderVersion;
+      const installer = await getLatestStableFabricInstaller();
+      const installerPath = path.join(serverDir, 'fabric-installer.jar');
+
+      onProgress({ stage: 'downloading', progress: 42, message: 'Downloading Fabric installer...' });
+      await downloadFile(installer.url, installerPath, pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(40 + pct * 0.25),
+          message: `Downloading Fabric installer... ${pct}%`,
+        });
+      });
+
+      onProgress({ stage: 'downloading', progress: 68, message: 'Running Fabric installer CLI...' });
+      const req = getRequiredJava(version);
+      const ji = detectJava(req);
+      const javaBin = ji.executablePath || 'java';
+      const run = runFabricInstallerServerCli(serverDir, javaBin, version, loaderVersion);
+      try { fs.unlinkSync(installerPath); } catch {}
+
+      if (run.status !== 0 || run.error || run.signal) {
+        const detail = `${run.stderr || ''}\n${run.stdout || ''}`.trim();
+        throw new Error(`Fabric install failed: ${detail.slice(0, 2000)}`);
+      }
+      const launchCandidates = ['fabric-server-launch.jar', 'fabric-server-launcher.jar'] as const;
+      for (const j of launchCandidates) {
+        if (fs.existsSync(path.join(serverDir, j))) {
+          newLaunchJar = j;
+          break;
+        }
+      }
+    } else if (type === 'forge') {
+      const forgeVersion = await getForgeVersionForGame(version);
+      meta.forgeVersion = forgeVersion;
+      const installerUrl = `https://maven.minecraftforge.net/net/minecraftforge/forge/${version}-${forgeVersion}/forge-${version}-${forgeVersion}-installer.jar`;
+      const installerPath = path.join(serverDir, 'forge-installer.jar');
+
+      onProgress({ stage: 'downloading', progress: 42, message: 'Downloading Forge installer...' });
+      await downloadFile(installerUrl, installerPath, pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(40 + pct * 0.25),
+          message: `Downloading Forge installer... ${pct}%`,
+        });
+      });
+
+      onProgress({ stage: 'downloading', progress: 68, message: 'Running Forge installer CLI...' });
+      const req = getRequiredJava(version);
+      const ji = detectJava(req);
+      const javaBin = ji.executablePath || 'java';
+      const run = runForgeInstallerServerCli(serverDir, javaBin);
+      try { fs.unlinkSync(installerPath); } catch {}
+      try { fs.unlinkSync(path.join(serverDir, 'forge-installer.jar.log')); } catch {}
+
+      if (run.status !== 0 || run.error || run.signal) {
+        const detail = `${run.stderr || ''}\n${run.stdout || ''}`.trim();
+        throw new Error(`Forge install failed: ${detail.slice(0, 2000)}`);
+      }
+      newLaunchJar = undefined;
+    } else if (type === 'neoforge') {
+      const info = await getNeoForgeInstallerInfo(version);
+      meta.neoforgeVersion = info.fullVersion;
+      const installerPath = path.join(serverDir, 'neoforge-installer.jar');
+
+      onProgress({ stage: 'downloading', progress: 42, message: 'Downloading NeoForge installer...' });
+      await downloadFile(info.installerUrl, installerPath, pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(40 + pct * 0.25),
+          message: `Downloading NeoForge installer... ${pct}%`,
+        });
+      });
+
+      onProgress({ stage: 'downloading', progress: 68, message: 'Running NeoForge installer CLI...' });
+      const req = getRequiredJava(version);
+      const ji = detectJava(req);
+      const javaBin = ji.executablePath || 'java';
+      const run = runNeoForgeInstallerServerCli(serverDir, javaBin);
+      try { fs.unlinkSync(installerPath); } catch {}
+
+      if (run.status !== 0 || run.error || run.signal) {
+        const detail = `${run.stderr || ''}\n${run.stdout || ''}`.trim();
+        throw new Error(`NeoForge install failed: ${detail.slice(0, 2000)}`);
+      }
+      newLaunchJar = undefined;
+    } else if (type === 'quilt') {
+      const { loaderVersion, installerUrl } = await getQuiltInstallerInfo(version);
+      meta.fabricLoader = loaderVersion;
+      const installerPath = path.join(serverDir, 'quilt-installer.jar');
+
+      onProgress({ stage: 'downloading', progress: 42, message: 'Downloading Quilt installer...' });
+      await downloadFile(installerUrl, installerPath, pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(40 + pct * 0.25),
+          message: `Downloading Quilt installer... ${pct}%`,
+        });
+      });
+
+      onProgress({ stage: 'downloading', progress: 68, message: 'Running Quilt installer CLI...' });
+      const req = getRequiredJava(version);
+      const ji = detectJava(req);
+      const javaBin = ji.executablePath || 'java';
+      const run = runQuiltInstallerServerCli(serverDir, javaBin, version, loaderVersion);
+      try { fs.unlinkSync(installerPath); } catch {}
+
+      if (run.status !== 0 || run.error || run.signal) {
+        const detail = `${run.stderr || ''}\n${run.stdout || ''}`.trim();
+        throw new Error(`Quilt install failed: ${detail.slice(0, 2000)}`);
+      }
+      const launchCandidates = ['quilt-server-launch.jar', 'quilt-server-launcher.jar'] as const;
+      for (const j of launchCandidates) {
+        if (fs.existsSync(path.join(serverDir, j))) {
+          newLaunchJar = j;
+          break;
+        }
+      }
+    } else if (type === 'arclight') {
+      const { url, jarName } = await getArclightDownloadInfo(version);
+      newLaunchJar = jarName;
+
+      onProgress({ stage: 'downloading', progress: 42, message: `Downloading Arclight ${version}...` });
+      await downloadFile(url, path.join(serverDir, jarName), pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(40 + pct * 0.5),
+          message: `Downloading Arclight ${version}... ${pct}%`,
+        });
+      });
+    } else if (type === 'bedrock') {
+      const info = await getBedrockDownloadInfo(version);
+      meta.version = info.version;
+      const zipPath = path.join(serverDir, `bedrock-server-${info.version}.zip`);
+
+      // Preserve user config & allowlist on in-place update
+      const preservedFiles = ['server.properties', 'allowlist.json', 'permissions.json'];
+      const backupsInMem = new Map<string, Buffer>();
+      if (retentionScope !== 'fresh') {
+        for (const f of preservedFiles) {
+          const p = path.join(serverDir, f);
+          if (fs.existsSync(p)) {
+            try { backupsInMem.set(f, fs.readFileSync(p)); } catch {}
+          }
+        }
+      }
+
+      onProgress({ stage: 'downloading', progress: 42, message: `Downloading Bedrock ${info.version}...` });
+      await downloadFile(info.url, zipPath, pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(42 + pct * 0.36),
+          message: `Downloading Bedrock ${info.version}... ${pct}%`,
+        });
+      });
+
+      onProgress({ stage: 'downloading', progress: 82, message: 'Extracting Bedrock Dedicated Server...' });
+      await extractArchive(zipPath, serverDir);
+      try { fs.unlinkSync(zipPath); } catch {}
+
+      if (process.platform !== 'win32') {
+        const binPath = path.join(serverDir, 'bedrock_server');
+        if (fs.existsSync(binPath)) {
+          try { fs.chmodSync(binPath, 0o755); } catch {}
+        }
+      }
+
+      for (const [f, buf] of backupsInMem.entries()) {
+        try { fs.writeFileSync(path.join(serverDir, f), buf); } catch {}
+      }
+
+      newLaunchJar = process.platform === 'win32' ? 'bedrock_server.exe' : 'bedrock_server';
+    } else {
+      // Paper, Purpur, Vanilla
+      let downloadUrl: string;
+      if (type === 'vanilla') {
+        downloadUrl = await getVanillaServerUrl(version);
+      } else if (type === 'purpur') {
+        const info = await getLatestPurpurBuild(version);
+        meta.build = info.build;
+        downloadUrl = info.url;
+      } else {
+        const info = await getLatestPaperInfo(version);
+        meta.build = info.build;
+        downloadUrl = info.url;
+      }
+      newLaunchJar = 'server.jar';
+      onProgress({ stage: 'downloading', progress: 42, message: `Downloading ${type} ${version}...` });
+      await downloadFile(downloadUrl, path.join(serverDir, 'server.jar'), pct => {
+        onProgress({
+          stage: 'downloading',
+          progress: Math.floor(40 + pct * 0.5),
+          message: `Downloading ${type} ${version}... ${pct}%`,
+        });
+      });
+    }
+
+    // 5. Finalize Configuration
+    onProgress({ stage: 'configuring', progress: 92, message: 'Updating metadata and runtime configuration...' });
+
+    if (newLaunchJar) {
+      meta.launchJar = newLaunchJar;
+    } else {
+      delete meta.launchJar;
+    }
+
+    // Auto-align Java version to required Java if user hasn't set a custom path (Java editions only)
+    if (type !== 'bedrock' && !meta.customJavaPath) {
+      const requiredJava = getRequiredJava(version);
+      meta.javaVersion = requiredJava;
+    }
+
+    // If eula doesn't exist, ensure eula is present (Java editions only)
+    if (type !== 'bedrock') {
+      const eulaPath = path.join(serverDir, 'eula.txt');
+      if (!fs.existsSync(eulaPath)) {
+        fs.writeFileSync(eulaPath, '#Accepted via Void Server\neula=true\n');
+      }
+    }
+
+    saveServerMeta(meta);
+
+    onProgress({ stage: 'done', progress: 100, message: `Successfully installed ${type} ${version}!` });
+    return meta;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    onProgress({ stage: 'error', progress: 0, message: 'Reinstallation failed', error: message });
     throw err;
   }
 }

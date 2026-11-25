@@ -3,7 +3,9 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawn, type ChildProcess } from 'node:child_process';
 import { getServerDir, getVoidDir } from '../utils/paths.js';
-import { getServerMeta } from './manager.js';
+import { getServerMeta, ensureAllServerSubdomains } from './manager.js';
+export { ensureAllServerSubdomains };
+import { stopAllExposures } from '../network/tunnelManager.js';
 import { getPidCpuMemory } from '../utils/pidStats.js';
 import type { ServerMeta } from './manager.js';
 import { analyzeLogs, getLatestCrashReport, type CrashAnalysis } from './crashAnalyzer.js';
@@ -117,6 +119,8 @@ interface ServerInstance {
 }
 
 export function isEulaAccepted(name: string): boolean {
+  const meta = getServerMeta(name);
+  if (meta?.type === 'bedrock') return true;
   const eulaPath = path.join(getServerDir(name), 'eula.txt');
   try {
     const content = fs.readFileSync(eulaPath, 'utf-8');
@@ -253,8 +257,8 @@ export function getLatestCrash(name: string): CrashAnalysis {
 }
 
 function parseLevel(line: string): LogLevel {
-  if (line.includes('joined the game')) return 'join';
-  if (line.includes('left the game')) return 'leave';
+  if (line.includes('joined the game') || line.includes('Player connected:')) return 'join';
+  if (line.includes('left the game') || line.includes('Player disconnected:')) return 'leave';
   if (line.includes('issued server command:')) return 'command';
   
   if (/\/WARN|WARN\]/.test(line)) return 'warn';
@@ -332,29 +336,44 @@ function handleUnexpectedCrash(
   code: number | null,
   addLog: (text: string, level?: LogLevel) => void
 ): void {
+  // Load fresh meta from disk to respect any live toggle of autoRestart
+  const freshMeta = getServerMeta(meta.name) || meta;
+  if (freshMeta.isFrozen) return;
+
+  // If autoRestart is explicitly disabled, do not auto-recover
+  if (freshMeta.autoRestart === false) {
+    addLog(`[VOID Watchdog] Server exited unexpectedly (code ${code ?? 'unknown'}). Auto-restart on crash is disabled for this server.`, 'warn');
+    return;
+  }
+
   const now = Date.now();
-  const history = (crashHistory.get(meta.name) || []).filter(t => now - t < 300000); // 5 minute window
+  const history = (crashHistory.get(freshMeta.name) || []).filter(t => now - t < 300000); // 5 minute window
   history.push(now);
-  crashHistory.set(meta.name, history);
+  crashHistory.set(freshMeta.name, history);
 
   if (history.length <= 3) {
     addLog(`[VOID Watchdog] Unexpected exit (code ${code ?? 'unknown'}). Auto-recovering in 3s (attempt ${history.length}/3 in 5m)...`, 'warn');
     setTimeout(() => {
-      if (!isShuttingDown && !instances.has(meta.name)) {
-        addLog(`[VOID Watchdog] Executing auto-restart for ${meta.name}...`, 'system');
-        void startServer(meta);
+      if (!isShuttingDown && !instances.has(freshMeta.name)) {
+        addLog(`[VOID Watchdog] Executing auto-restart for ${freshMeta.name}...`, 'system');
+        void startServer(freshMeta);
       }
     }, 3000);
   } else {
-    addLog(`[VOID Watchdog] Crash loop prevented: ${meta.name} crashed 3 times within 5 minutes. Auto-recovery paused to protect system resources.`, 'error');
+    addLog(`[VOID Watchdog] Crash loop prevented: ${freshMeta.name} crashed 3 times within 5 minutes. Auto-recovery paused to protect system resources.`, 'error');
   }
 }
 
 export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => void): Promise<void> {
+  if (meta.isFrozen) {
+    throw new Error(`Server "${meta.name}" is currently frozen. Unfreeze it from Server Settings before starting.`);
+  }
   if (instances.has(meta.name)) return; // Already running
   
   const joinRegex = /: (.*) joined the game/;
   const leaveRegex = /: (.*) left the game/;
+  const bedrockJoinRegex = /Player connected:\s*([^,]+),\s*xuid:/i;
+  const bedrockLeaveRegex = /Player disconnected:\s*([^,]+),\s*xuid:/i;
 
   const instance: ServerInstance = {
     process: null as unknown as ChildProcess,
@@ -369,10 +388,10 @@ export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => vo
     const trimmed = text.trimEnd();
     if (!trimmed) return;
     
-    const joinMatch = trimmed.match(joinRegex);
-    if (joinMatch) instance.onlinePlayers.add(joinMatch[1]);
-    const leaveMatch = trimmed.match(leaveRegex);
-    if (leaveMatch) instance.onlinePlayers.delete(leaveMatch[1]);
+    const joinMatch = trimmed.match(joinRegex) || trimmed.match(bedrockJoinRegex);
+    if (joinMatch) instance.onlinePlayers.add(joinMatch[1].trim());
+    const leaveMatch = trimmed.match(leaveRegex) || trimmed.match(bedrockLeaveRegex);
+    if (leaveMatch) instance.onlinePlayers.delete(leaveMatch[1].trim());
 
     const log: LogLine = {
       text: trimmed,
@@ -399,89 +418,109 @@ export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => vo
   console.log(`[DEBUG] Handling start_server for ${meta.name} (version: ${meta.version})`);
 
   try {
-
-    console.log(`[DEBUG] Java utilities imported`);
-    
-    let javaExecutable = 'java';
-    if (meta.customJavaPath && fs.existsSync(meta.customJavaPath)) {
-      javaExecutable = meta.customJavaPath;
-      addLog(`[VOID] Using custom Java binary: ${javaExecutable}`, 'system');
-    } else {
-      const targetJavaVersion = meta.javaVersion || getRequiredJava(meta.version);
-      console.log(`[DEBUG] Target Java: ${targetJavaVersion}`);
-      addLog(`[VOID] Checking Java requirements (needs Java ${targetJavaVersion})...`, 'system');
-      
-      let javaInfo = detectJava(targetJavaVersion);
-      javaExecutable = javaInfo.executablePath || 'java';
-
-      if (!javaInfo.isCompatible) {
-        addLog(`[VOID] Java ${targetJavaVersion} is required. Auto-downloading...`, 'system');
-        javaExecutable = await installJava(targetJavaVersion, (msg: string) => {
-          addLog(`[VOID] ${msg}`, 'system');
-        });
-      } else {
-        addLog(`[VOID] Found Java ${javaInfo.versionString} at ${javaExecutable}`, 'system');
-      }
-    }
-
     const serverDir = getServerDir(meta.name);
-    const jvmFlags = resolveJvmFlags(meta);
-    addLog(`[VOID] JVM Preset: ${meta.jvmPreset || 'aikar'} (${jvmFlags.length} flags)`, 'system');
-    
-    let spawnArgs: string[] = [];
-    const isForge = meta.type === 'forge' || meta.type === 'neoforge';
-    const hasCustomJarOverride = Boolean(meta.launchJar && !meta.launchJar.startsWith('@libraries') && fs.existsSync(path.join(serverDir, meta.launchJar)));
-    const hasForgeLib = fs.existsSync(path.join(serverDir, 'libraries', 'net', 'minecraftforge', 'forge')) || fs.existsSync(path.join(serverDir, 'libraries', 'net', 'neoforged', 'neoforge'));
-    const isModernForge = (isForge || Boolean(meta.launchJar?.startsWith('@libraries'))) && !hasCustomJarOverride && (fs.existsSync(path.join(serverDir, 'user_jvm_args.txt')) || hasForgeLib);
+    let proc: ChildProcess;
 
-    if (isModernForge) {
-      const forgePath = meta.type === 'neoforge'
-        ? ['net', 'neoforged', 'neoforge']
-        : ['net', 'minecraftforge', 'forge'];
-      const forgeLibDir = path.join(serverDir, 'libraries', ...forgePath);
-      let argsFileRelativePath = '';
+    if (meta.type === 'bedrock') {
+      const binName = process.platform === 'win32' ? 'bedrock_server.exe' : 'bedrock_server';
+      const binPath = path.join(serverDir, binName);
+      if (!fs.existsSync(binPath)) {
+        throw new Error(`Bedrock executable "${binName}" not found in ${serverDir}. Try reinstalling the server from Settings.`);
+      }
+      addLog(`[VOID] Starting native Bedrock Dedicated Server (${binName}) on UDP port ${meta.port || 19132}...`, 'system');
+      const env =
+        process.platform === 'win32'
+          ? { ...process.env }
+          : { ...process.env, LD_LIBRARY_PATH: serverDir };
+      proc = spawn(binPath, [], {
+        cwd: serverDir,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env,
+        windowsHide: true,
+      });
+    } else {
+      console.log(`[DEBUG] Java utilities imported`);
       
-      if (fs.existsSync(forgeLibDir)) {
-        const subdirs = fs.readdirSync(forgeLibDir);
-        const versionDirName = subdirs.find(d => fs.statSync(path.join(forgeLibDir, d)).isDirectory());
-        if (versionDirName) {
-          const argsFileName = process.platform === 'win32' ? 'win_args.txt' : 'unix_args.txt';
-          const absoluteArgsPath = path.join(forgeLibDir, versionDirName, argsFileName);
-          if (fs.existsSync(absoluteArgsPath)) {
-            argsFileRelativePath = path.relative(serverDir, absoluteArgsPath);
-          }
+      let javaExecutable = 'java';
+      if (meta.customJavaPath && fs.existsSync(meta.customJavaPath)) {
+        javaExecutable = meta.customJavaPath;
+        addLog(`[VOID] Using custom Java binary: ${javaExecutable}`, 'system');
+      } else {
+        const targetJavaVersion = meta.javaVersion || getRequiredJava(meta.version);
+        console.log(`[DEBUG] Target Java: ${targetJavaVersion}`);
+        addLog(`[VOID] Checking Java requirements (needs Java ${targetJavaVersion})...`, 'system');
+        
+        let javaInfo = detectJava(targetJavaVersion);
+        javaExecutable = javaInfo.executablePath || 'java';
+
+        if (!javaInfo.isCompatible) {
+          addLog(`[VOID] Java ${targetJavaVersion} is required. Auto-downloading...`, 'system');
+          javaExecutable = await installJava(targetJavaVersion, (msg: string) => {
+            addLog(`[VOID] ${msg}`, 'system');
+          });
+        } else {
+          addLog(`[VOID] Found Java ${javaInfo.versionString} at ${javaExecutable}`, 'system');
         }
       }
-      
-      if (!argsFileRelativePath) {
-        throw new Error(`Modern ${meta.type === 'neoforge' ? 'NeoForge' : 'Forge'} installed but could not find win_args.txt / unix_args.txt in libraries/${forgePath.join('/')}/`);
-      }
-      
-      spawnArgs = [
-        `-Xmx${meta.ram}`,
-        `-Xms512M`,
-        ...jvmFlags,
-        ...(fs.existsSync(path.join(serverDir, 'user_jvm_args.txt')) ? ['@user_jvm_args.txt'] : []),
-        `@${argsFileRelativePath}`,
-        'nogui'
-      ];
-    } else {
-      const jarName = resolveServerJarName(meta, serverDir);
-      spawnArgs = [
-        `-Xmx${meta.ram}`,
-        `-Xms512M`,
-        ...jvmFlags,
-        '-jar',
-        jarName,
-        'nogui',
-      ];
-    }
 
-    const proc = spawn(
-      javaExecutable,
-      spawnArgs,
-      { cwd: serverDir, stdio: ['pipe', 'pipe', 'pipe'] }
-    );
+      const jvmFlags = resolveJvmFlags(meta);
+      addLog(`[VOID] JVM Preset: ${meta.jvmPreset || 'aikar'} (${jvmFlags.length} flags)`, 'system');
+      
+      let spawnArgs: string[] = [];
+      const isForge = meta.type === 'forge' || meta.type === 'neoforge';
+      const hasCustomJarOverride = Boolean(meta.launchJar && !meta.launchJar.startsWith('@libraries') && fs.existsSync(path.join(serverDir, meta.launchJar)));
+      const hasForgeLib = fs.existsSync(path.join(serverDir, 'libraries', 'net', 'minecraftforge', 'forge')) || fs.existsSync(path.join(serverDir, 'libraries', 'net', 'neoforged', 'neoforge'));
+      const isModernForge = (isForge || Boolean(meta.launchJar?.startsWith('@libraries'))) && !hasCustomJarOverride && (fs.existsSync(path.join(serverDir, 'user_jvm_args.txt')) || hasForgeLib);
+
+      if (isModernForge) {
+        const forgePath = meta.type === 'neoforge'
+          ? ['net', 'neoforged', 'neoforge']
+          : ['net', 'minecraftforge', 'forge'];
+        const forgeLibDir = path.join(serverDir, 'libraries', ...forgePath);
+        let argsFileRelativePath = '';
+        
+        if (fs.existsSync(forgeLibDir)) {
+          const subdirs = fs.readdirSync(forgeLibDir);
+          const versionDirName = subdirs.find(d => fs.statSync(path.join(forgeLibDir, d)).isDirectory());
+          if (versionDirName) {
+            const argsFileName = process.platform === 'win32' ? 'win_args.txt' : 'unix_args.txt';
+            const absoluteArgsPath = path.join(forgeLibDir, versionDirName, argsFileName);
+            if (fs.existsSync(absoluteArgsPath)) {
+              argsFileRelativePath = path.relative(serverDir, absoluteArgsPath);
+            }
+          }
+        }
+        
+        if (!argsFileRelativePath) {
+          throw new Error(`Modern ${meta.type === 'neoforge' ? 'NeoForge' : 'Forge'} installed but could not find win_args.txt / unix_args.txt in libraries/${forgePath.join('/')}/`);
+        }
+        
+        spawnArgs = [
+          `-Xmx${meta.ram}`,
+          `-Xms512M`,
+          ...jvmFlags,
+          ...(fs.existsSync(path.join(serverDir, 'user_jvm_args.txt')) ? ['@user_jvm_args.txt'] : []),
+          `@${argsFileRelativePath}`,
+          'nogui'
+        ];
+      } else {
+        const jarName = resolveServerJarName(meta, serverDir);
+        spawnArgs = [
+          `-Xmx${meta.ram}`,
+          `-Xms512M`,
+          ...jvmFlags,
+          '-jar',
+          jarName,
+          'nogui',
+        ];
+      }
+
+      proc = spawn(
+        javaExecutable,
+        spawnArgs,
+        { cwd: serverDir, stdio: ['pipe', 'pipe', 'pipe'] }
+      );
+    }
 
     instance.process = proc;
 
@@ -489,8 +528,11 @@ export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => vo
     proc.stdout?.on('data', (data: string) => {
       for (const line of data.split('\n')) {
         addLog(line);
-        // Robust detection for Vanilla, Paper, and Forge
-        if (instance.status === 'starting' && (/Done \([\d.]+s\)!/.test(line) || line.includes(']: Done ('))) {
+        // Robust detection for Vanilla, Paper, Forge, and Bedrock Dedicated Server
+        if (
+          instance.status === 'starting' &&
+          (/Done \([\d.]+s\)!/.test(line) || line.includes(']: Done (') || line.includes('Server started.'))
+        ) {
           instance.status = 'online';
           notifyStatus(meta.name, 'online');
           addLog(`[VOID] Server is now ONLINE`, 'system');
@@ -530,6 +572,8 @@ export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => vo
         addLog(`[VOID] Auto-restarting server...`, 'system');
         // Small delay to ensure any file locks are released
         setTimeout(() => startServer(meta), 1000);
+      } else if (!instance.userInitiatedStop && !isShuttingDown) {
+        handleUnexpectedCrash(meta, code, addLog);
       }
     });
   } catch (err: any) {
@@ -541,6 +585,7 @@ export async function startServer(meta: ServerMeta, onLog?: (log: LogLine) => vo
 export function stopServer(name: string): void {
   const inst = instances.get(name);
   if (!inst) return;
+  inst.userInitiatedStop = true;
   inst.status = 'stopping';
   notifyStatus(name, 'stopping');
   inst.logs.push({ text: `[VOID] Shutdown requested by user...`, level: 'system', timestamp: new Date() });
@@ -558,6 +603,7 @@ export function restartServer(name: string): void {
 export function killServer(name: string): void {
   const inst = instances.get(name);
   if (!inst) return;
+  inst.userInitiatedStop = true;
   inst.logs.push({ text: `[VOID] Force Kill requested by user!`, level: 'error', timestamp: new Date() });
   if (inst.process) inst.process.kill('SIGKILL');
   instances.delete(name);
@@ -611,6 +657,23 @@ export function getServerStatus(name: string): ServerStatus {
 
 export function getServerLogs(name: string): LogLine[] {
   return instances.get(name)?.logs ?? [];
+}
+
+export function appendServerLog(name: string, text: string, level: LogLevel = 'system'): void {
+  const instance = instances.get(name);
+  if (instance) {
+    const log: LogLine = {
+      text,
+      level,
+      timestamp: new Date(),
+    };
+    if (instance.logs.length >= 500) instance.logs.shift();
+    instance.logs.push(log);
+    const listeners = serverListeners.get(name);
+    if (listeners) {
+      listeners.forEach((l) => l(log));
+    }
+  }
 }
 
 export function subscribeToLogs(
@@ -677,6 +740,7 @@ export function waitForServerStop(name: string, timeoutMs = 15000): Promise<void
 }
 
 export async function stopAllServers(): Promise<void> {
+  await stopAllExposures().catch(() => {});
   const running = Array.from(instances.keys());
   if (running.length === 0) return;
 

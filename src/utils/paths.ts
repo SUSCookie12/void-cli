@@ -30,7 +30,24 @@ export function getServerDir(name: string): string {
 }
 
 export function getLocalBackupsDir(serverId: string): string {
-  const dir = path.join(getVoidDir(), 'backups', serverId);
+  if (serverId) {
+    try {
+      const serverDir = getServerDir(serverId);
+      const metaPath = path.join(serverDir, 'meta.json');
+      if (fs.existsSync(metaPath)) {
+        const meta = JSON.parse(fs.readFileSync(metaPath, 'utf-8'));
+        if (meta && typeof meta.backupDir === 'string' && meta.backupDir.trim().length > 0) {
+          const customDir = path.resolve(meta.backupDir.trim());
+          if (!fs.existsSync(customDir)) fs.mkdirSync(customDir, { recursive: true });
+          return customDir;
+        }
+      }
+    } catch {}
+    const dir = path.join(getServerDir(serverId), 'backups');
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+  const dir = path.join(getVoidDir(), 'backups');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
 }

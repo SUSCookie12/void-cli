@@ -19,28 +19,48 @@ if (!isMainThread) {
   const runWorkerTask = async () => {
     try {
       const { task, data } = workerData || {};
-      const archiverFn = (archiverModule as any)?.default || archiverModule;
+      const createZipArchive = (opts: any) => {
+        const mod = archiverModule as any;
+        if (typeof mod?.ZipArchive === 'function') return new mod.ZipArchive(opts);
+        const fn = mod?.default || mod;
+        if (typeof fn === 'function') return fn('zip', opts);
+        throw new Error('Archiver ZipArchive constructor not found');
+      };
 
       if (task === 'zipFolder') {
-        const { sourceFolder, destZipPath } = data;
+        const { sourceFolder, destZipPath, totalBytes = 0 } = data;
         const output = fs.createWriteStream(destZipPath);
-        const archive = archiverFn('zip', {
-          zlib: { level: 6 },
+        const archive = createZipArchive({
+          zlib: { level: 1 },
           forceZip64: true,
         });
 
-        let totalFiles = 0;
+        let lastPercent = -1;
         archive.on('progress', (prog: any) => {
-          if (prog.entries.total > totalFiles) totalFiles = prog.entries.total;
-          const percent = totalFiles > 0
-            ? Math.min(99, Math.round((prog.entries.processed / totalFiles) * 100))
-            : 50;
-          parentPort?.postMessage({ status: 'progress', percent });
+          let percent = 0;
+          if (totalBytes > 0 && typeof prog?.fs?.processedBytes === 'number') {
+            percent = Math.min(99, Math.max(1, Math.round((prog.fs.processedBytes / totalBytes) * 100)));
+          } else if (prog?.entries?.total > 0 && prog?.entries?.processed > 0) {
+            percent = Math.min(99, Math.max(1, Math.round((prog.entries.processed / prog.entries.total) * 100)));
+          } else {
+            percent = 5;
+          }
+          if (percent !== lastPercent) {
+            lastPercent = percent;
+            parentPort?.postMessage({ status: 'progress', percent });
+          }
         });
 
-        output.on('close', () => {
-          parentPort?.postMessage({ status: 'success' });
-        });
+        let finished = false;
+        const markSuccess = () => {
+          if (!finished) {
+            finished = true;
+            parentPort?.postMessage({ status: 'success' });
+          }
+        };
+
+        output.on('close', markSuccess);
+        output.on('finish', markSuccess);
 
         archive.on('error', (err: any) => {
           parentPort?.postMessage({ status: 'error', error: err.message || String(err) });
@@ -51,28 +71,42 @@ if (!isMainThread) {
         });
 
         archive.pipe(output);
-        archive.directory(sourceFolder, false);
+        archive.directory(sourceFolder, false, (data: any) => (data.name === 'backups' || data.name.startsWith('backups/') || data.name.startsWith('backups\\\\')) ? false : data);
         await archive.finalize();
       } else if (task === 'zipSelection') {
-        const { rootDir, selections, destZipPath } = data;
+        const { rootDir, selections, destZipPath, totalBytes = 0 } = data;
         const output = fs.createWriteStream(destZipPath);
-        const archive = archiverFn('zip', {
-          zlib: { level: 6 },
+        const archive = createZipArchive({
+          zlib: { level: 1 },
           forceZip64: true,
         });
 
-        let totalFiles = 0;
+        let lastPercent = -1;
         archive.on('progress', (prog: any) => {
-          if (prog.entries.total > totalFiles) totalFiles = prog.entries.total;
-          const percent = totalFiles > 0
-            ? Math.min(99, Math.round((prog.entries.processed / totalFiles) * 100))
-            : 50;
-          parentPort?.postMessage({ status: 'progress', percent });
+          let percent = 0;
+          if (totalBytes > 0 && typeof prog?.fs?.processedBytes === 'number') {
+            percent = Math.min(99, Math.max(1, Math.round((prog.fs.processedBytes / totalBytes) * 100)));
+          } else if (prog?.entries?.total > 0 && prog?.entries?.processed > 0) {
+            percent = Math.min(99, Math.max(1, Math.round((prog.entries.processed / prog.entries.total) * 100)));
+          } else {
+            percent = 5;
+          }
+          if (percent !== lastPercent) {
+            lastPercent = percent;
+            parentPort?.postMessage({ status: 'progress', percent });
+          }
         });
 
-        output.on('close', () => {
-          parentPort?.postMessage({ status: 'success' });
-        });
+        let finished = false;
+        const markSuccess = () => {
+          if (!finished) {
+            finished = true;
+            parentPort?.postMessage({ status: 'success' });
+          }
+        };
+
+        output.on('close', markSuccess);
+        output.on('finish', markSuccess);
 
         archive.on('error', (err: any) => {
           parentPort?.postMessage({ status: 'error', error: err.message || String(err) });
@@ -151,14 +185,6 @@ if (!isMainThread) {
         } catch {
           // ignore malformed JSON
         }
-      });
-      process.stdin.on('end', () => {
-        console.log('[VOID] stdin EOF received (parent exited), shutting down...');
-        void shutdown();
-      });
-      process.stdin.on('close', () => {
-        console.log('[VOID] stdin closed (parent exited), shutting down...');
-        void shutdown();
       });
     }
   }

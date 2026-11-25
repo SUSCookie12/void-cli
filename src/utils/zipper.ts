@@ -14,38 +14,95 @@ const getCurrentFilePath = (): string => {
   return path.resolve(process.argv[1]);
 };
 
+export function getFolderTotalBytes(folderPath: string): number {
+  let total = 0;
+  if (!fs.existsSync(folderPath)) return 0;
+  try {
+    const entries = fs.readdirSync(folderPath, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name === 'backups') continue;
+      const fullPath = path.join(folderPath, entry.name);
+      if (entry.isDirectory()) {
+        total += getFolderTotalBytes(fullPath);
+      } else if (entry.isFile()) {
+        try {
+          total += fs.statSync(fullPath).size;
+        } catch {}
+      }
+    }
+  } catch {}
+  return total;
+}
+
+export function getSelectionTotalBytes(rootDir: string, selections: string[]): number {
+  let total = 0;
+  for (const sel of selections) {
+    const full = path.resolve(rootDir, sel);
+    if (!fs.existsSync(full)) continue;
+    try {
+      const stat = fs.statSync(full);
+      if (stat.isDirectory()) {
+        total += getFolderTotalBytes(full);
+      } else if (stat.isFile()) {
+        total += stat.size;
+      }
+    } catch {}
+  }
+  return total;
+}
+
 // Standalone JS worker code to be run in development via eval: true.
 // Uses streaming archiver with Zip64 to handle archives of any size (>2GB, >4GB) without Buffer limits.
 const devWorkerCode = `
-(() => {
+(async () => {
   const { parentPort, workerData } = require('worker_threads');
-  const archiverModule = require('archiver');
-  const archiver = archiverModule.default || archiverModule;
   const fs = require('fs');
   const path = require('path');
 
   try {
+    const archiverModule = await import('archiver');
+    const createZipArchive = (opts) => {
+      if (typeof archiverModule.ZipArchive === 'function') return new archiverModule.ZipArchive(opts);
+      const fn = archiverModule.default || archiverModule;
+      if (typeof fn === 'function') return fn('zip', opts);
+      throw new Error('Archiver ZipArchive constructor not found');
+    };
+
     const { task, data } = workerData || {};
     if (task === 'zipFolder') {
-      const { sourceFolder, destZipPath } = data;
+      const { sourceFolder, destZipPath, totalBytes = 0 } = data;
       const output = fs.createWriteStream(destZipPath);
-      const archive = archiver('zip', {
-        zlib: { level: 6 },
+      const archive = createZipArchive({
+        zlib: { level: 1 },
         forceZip64: true,
       });
 
-      let totalFiles = 0;
+      let lastPercent = -1;
       archive.on('progress', (prog) => {
-        if (prog.entries.total > totalFiles) totalFiles = prog.entries.total;
-        const percent = totalFiles > 0
-          ? Math.min(99, Math.round((prog.entries.processed / totalFiles) * 100))
-          : 50;
-        parentPort?.postMessage({ status: 'progress', percent });
+        let percent = 0;
+        if (totalBytes > 0 && typeof prog?.fs?.processedBytes === 'number') {
+          percent = Math.min(99, Math.max(1, Math.round((prog.fs.processedBytes / totalBytes) * 100)));
+        } else if (prog?.entries?.total > 0 && prog?.entries?.processed > 0) {
+          percent = Math.min(99, Math.max(1, Math.round((prog.entries.processed / prog.entries.total) * 100)));
+        } else {
+          percent = 5;
+        }
+        if (percent !== lastPercent) {
+          lastPercent = percent;
+          parentPort?.postMessage({ status: 'progress', percent });
+        }
       });
 
-      output.on('close', () => {
-        parentPort?.postMessage({ status: 'success' });
-      });
+      let finished = false;
+      const markSuccess = () => {
+        if (!finished) {
+          finished = true;
+          parentPort?.postMessage({ status: 'success' });
+        }
+      };
+
+      output.on('close', markSuccess);
+      output.on('finish', markSuccess);
 
       archive.on('error', (err) => {
         parentPort?.postMessage({ status: 'error', error: err.message || String(err) });
@@ -56,28 +113,42 @@ const devWorkerCode = `
       });
 
       archive.pipe(output);
-      archive.directory(sourceFolder, false);
+      archive.directory(sourceFolder, false, (data) => (data.name === 'backups' || data.name.startsWith('backups/') || data.name.startsWith('backups\\\\')) ? false : data);
       await archive.finalize();
     } else if (task === 'zipSelection') {
-      const { rootDir, selections, destZipPath } = data;
+      const { rootDir, selections, destZipPath, totalBytes = 0 } = data;
       const output = fs.createWriteStream(destZipPath);
-      const archive = archiver('zip', {
-        zlib: { level: 6 },
+      const archive = createZipArchive({
+        zlib: { level: 1 },
         forceZip64: true,
       });
 
-      let totalFiles = 0;
+      let lastPercent = -1;
       archive.on('progress', (prog) => {
-        if (prog.entries.total > totalFiles) totalFiles = prog.entries.total;
-        const percent = totalFiles > 0
-          ? Math.min(99, Math.round((prog.entries.processed / totalFiles) * 100))
-          : 50;
-        parentPort?.postMessage({ status: 'progress', percent });
+        let percent = 0;
+        if (totalBytes > 0 && typeof prog?.fs?.processedBytes === 'number') {
+          percent = Math.min(99, Math.max(1, Math.round((prog.fs.processedBytes / totalBytes) * 100)));
+        } else if (prog?.entries?.total > 0 && prog?.entries?.processed > 0) {
+          percent = Math.min(99, Math.max(1, Math.round((prog.entries.processed / prog.entries.total) * 100)));
+        } else {
+          percent = 5;
+        }
+        if (percent !== lastPercent) {
+          lastPercent = percent;
+          parentPort?.postMessage({ status: 'progress', percent });
+        }
       });
 
-      output.on('close', () => {
-        parentPort?.postMessage({ status: 'success' });
-      });
+      let finished = false;
+      const markSuccess = () => {
+        if (!finished) {
+          finished = true;
+          parentPort?.postMessage({ status: 'success' });
+        }
+      };
+
+      output.on('close', markSuccess);
+      output.on('finish', markSuccess);
 
       archive.on('error', (err) => {
         parentPort?.postMessage({ status: 'error', error: err.message || String(err) });
@@ -112,16 +183,18 @@ export function compressFolder(
   sourceFolder: string,
   destZipPath: string,
   onProgress?: (percent: number) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  excludedDir?: string
 ): Promise<void> {
   return new Promise((resolve, reject) => {
     try {
       const workerPath = getCurrentFilePath();
       const isDev = workerPath.endsWith('.ts') || workerPath.endsWith('.tsx');
+      const totalBytes = getFolderTotalBytes(sourceFolder, excludedDir);
       
       const workerData = {
         task: 'zipFolder',
-        data: { sourceFolder, destZipPath }
+        data: { sourceFolder, destZipPath, totalBytes, excludedDir }
       };
 
       const worker = isDev
@@ -191,9 +264,10 @@ export function createZipFromSelection(
       const workerPath = getCurrentFilePath();
       const isDev = workerPath.endsWith('.ts') || workerPath.endsWith('.tsx');
       
+      const totalBytes = getSelectionTotalBytes(rootDir, selections);
       const workerData = {
         task: 'zipSelection',
-        data: { rootDir, selections, destZipPath }
+        data: { rootDir, selections, destZipPath, totalBytes }
       };
 
       const worker = isDev

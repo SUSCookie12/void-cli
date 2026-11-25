@@ -20,8 +20,8 @@ import {
   getLatestCrash,
   waitForServerStop
 } from '../server/instance.js';
-import { listServers, deleteServer, renameServer, getNextAvailablePort, getServerMeta, saveServerMeta, serverExists, isValidServerName } from '../server/manager.js';
-import { installServer, importServerFromSource, inspectServerDirectory } from '../server/installer.js';
+import { listServers, deleteServer, renameServer, getNextAvailablePort, getServerMeta, saveServerMeta, serverExists, isValidServerName, slugifyServerName } from '../server/manager.js';
+import { installServer, reinstallServer, importServerFromSource, inspectServerDirectory } from '../server/installer.js';
 import { listServerJarsInDir, resolveServerJarName } from '../server/instance.js';
 import { readProperties, writeProperties } from '../server/properties.js';
 import { uploadToMclogs } from '../server/crashAnalyzer.js';
@@ -42,8 +42,8 @@ import {
   createEntry, 
   renameEntry 
 } from '../utils/fileExplorer.js';
-import { listPlugins, togglePlugin } from '../utils/plugins.js';
-import { listMods, toggleMod } from '../utils/mods.js';
+import { listPlugins, togglePlugin, savePluginMetadata, resolveMissingPluginMetadata } from '../utils/plugins.js';
+import { listMods, toggleMod, saveModMetadata, resolveMissingModMetadata } from '../utils/mods.js';
 import { compressFolder, extractArchive } from '../utils/zipper.js';
 import { 
   getTrashSummary, 
@@ -54,11 +54,17 @@ import {
   pruneExpiredTrash 
 } from '../utils/trash.js';
 import { getServerDir, getLocalBackupsDir } from '../utils/paths.js';
+import { calculateServerDiskSize, invalidateServerDiskCache, getSystemDrives, browseHostDirectories, createHostDirectory, getFastFolderSize } from '../utils/hostFs.js';
 import { getRunningServers } from '../server/instance.js';
 import { DAEMON_VERSION } from '../version.js';
 import { startExpose, stopExpose, getTunnelState } from './tunnelManager.js';
-import { isValidSubdomain } from './dnsManager.js';
+import { isValidSubdomain, deleteTunnelDns } from './dnsManager.js';
+import { containsDisallowedWords } from '../utils/subdomainFilter.js';
+import { VOID_DOMAIN } from '../config/dns.js';
+import { generateRandomSubdomain } from '../utils/wordGenerator.js';
+import { updateAllServerStatusPages, setServerFrozenStatus } from '../server/statusPage.js';
 import { getArclightVersions } from '../api/arclight.js';
+import { getBedrockVersions } from '../api/bedrock.js';
 import { getVanillaReleases } from '../api/mojang.js';
 import { getPaperVersions } from '../api/paper.js';
 import { getFabricGameVersions } from '../api/fabric.js';
@@ -66,6 +72,7 @@ import { getForgeGameVersions } from '../api/forge.js';
 import { getPurpurVersions } from '../api/purpur.js';
 import { getNeoForgeGameVersions } from '../api/neoforge.js';
 import { getQuiltGameVersions } from '../api/quilt.js';
+import { getSchedules, saveSchedules, getScheduleLogs, clearScheduleLogs, runScheduleNow } from '../server/scheduler.js';
 import net from 'node:net';
 import https from 'node:https';
 import { execSync } from 'node:child_process';
@@ -236,6 +243,8 @@ export function broadcastLogLine(serverName: string, log: any) {
   }
 }
 
+const broadcastToPeers = (message: Record<string, unknown>) => broadcastToWebRtc(message);
+
 export function broadcastToWebRtc(message: Record<string, unknown>) {
   const payload = JSON.stringify(message);
   for (const chan of openChannels) {
@@ -253,6 +262,18 @@ export function broadcastToWebRtc(message: Record<string, unknown>) {
 
 const activeBackupControllers = new Map<string, AbortController>();
 
+export function registerActiveBackupController(server: string, controller: AbortController) {
+  activeBackupControllers.set(server, controller);
+}
+
+export function clearActiveBackupController(server: string) {
+  for (const key of Array.from(activeBackupControllers.keys())) {
+    if (key.toLowerCase() === server.toLowerCase()) {
+      activeBackupControllers.delete(key);
+    }
+  }
+}
+
 export interface ActiveBackupState {
   server: string;
   status: 'idle' | 'zipping' | 'uploading' | 'downloading' | 'extracting';
@@ -267,7 +288,13 @@ let activeBackupState: ActiveBackupState = {
   activeType: 'idle'
 };
 
-function updateBackupState(
+export function isServerBackupActive(server?: string): boolean {
+  if (activeBackupState.status === 'idle') return false;
+  if (!server) return true;
+  return activeBackupState.server.toLowerCase() === server.toLowerCase();
+}
+
+export function updateBackupState(
   server: string,
   status: 'idle' | 'zipping' | 'uploading' | 'downloading' | 'extracting',
   progress: number,
@@ -292,6 +319,50 @@ function updateBackupState(
       openChannels.delete(chan);
     }
   }
+}
+
+const activeFileUploads = new Map<string, Set<string>>();
+
+function registerActiveFileUpload(server: string, sessionId: string) {
+  const key = server.toLowerCase();
+  let set = activeFileUploads.get(key);
+  if (!set) {
+    set = new Set<string>();
+    activeFileUploads.set(key, set);
+  }
+  set.add(sessionId);
+  broadcastToWebRtc({ type: 'upload_status', server, active: true, count: set.size });
+}
+
+function unregisterActiveFileUpload(server: string, sessionId: string) {
+  const key = server.toLowerCase();
+  const set = activeFileUploads.get(key);
+  if (!set) return;
+  set.delete(sessionId);
+  const count = set.size;
+  if (count === 0) {
+    activeFileUploads.delete(key);
+  }
+  broadcastToWebRtc({ type: 'upload_status', server, active: count > 0, count });
+}
+
+export function isServerFileUploadActive(server: string): boolean {
+  return (activeFileUploads.get(server.toLowerCase())?.size || 0) > 0;
+}
+
+function sendBackupBusyError(channel: any): boolean {
+  if (activeBackupState.status === 'idle') return false;
+  channel.send(JSON.stringify({
+    type: 'error',
+    code: 'SERVER_BUSY_BACKUP',
+    preserveBackupState: true,
+    message: `Server "${activeBackupState.server}" is currently ${activeBackupState.status} a backup (${activeBackupState.progress}%). Please wait for it to finish or cancel it first.`
+  }));
+  return true;
+}
+
+function isBackupAbortError(err: any, signal?: AbortSignal): boolean {
+  return Boolean(signal?.aborted || err?.name === 'AbortError' || err?.message === 'Backup aborted');
 }
 
 
@@ -544,20 +615,28 @@ export function initWebRTCSignaling(uid: string, daemonId: string): () => void {
               if (channel.readyState === 'open') {
                 setTimeout(pushInitialServers, 50);
               }
-              channel.stateChanged.subscribe((state) => {
-                if (state === 'open') {
-                  setTimeout(pushInitialServers, 50);
-                } else {
-                  openChannels.delete(channel);
-                }
-              });
-
               const activeTransfers = new Map<string, {
                 writeStream?: fs.WriteStream;
                 path: string;
                 size: number;
                 received: number;
+                server?: string;
               }>();
+              channel.stateChanged.subscribe((state) => {
+                if (state === 'open') {
+                  setTimeout(pushInitialServers, 50);
+                } else {
+                  openChannels.delete(channel);
+                  for (const [sid, t] of activeTransfers.entries()) {
+                    try { t.writeStream?.destroy(); } catch {}
+                    try {
+                      if (t.path && fs.existsSync(t.path)) fs.unlinkSync(t.path);
+                    } catch {}
+                    if (t.server) unregisterActiveFileUpload(t.server, sid);
+                  }
+                  activeTransfers.clear();
+                }
+              });
               const statsInterval = setInterval(async () => {
                 if (channel.readyState === 'open') {
                   const peerUid = channelUserMap.get(channel) || currentOwnerUid;
@@ -706,6 +785,7 @@ async function handleBinaryMessage(channel: any, data: Buffer, transfers: Map<st
   if (transfer.received >= transfer.size) {
     transfer.writeStream.end();
     transfers.delete(sessionId);
+    if (transfer.server) unregisterActiveFileUpload(transfer.server, sessionId);
     channel.send(JSON.stringify({ type: 'upload_success', path: transfer.path }));
   }
 }
@@ -774,16 +854,30 @@ export async function sendServersList(channel?: any) {
       sharedPermissions = grant.permissions;
     }
     const tunnel = getTunnelState(meta.name);
+    const hasActiveBackup =
+      activeBackupState.status !== 'idle' &&
+      activeBackupState.server.toLowerCase() === meta.name.toLowerCase();
     serverData.push({
       ...meta,
       isRunning: running.includes(meta.name),
       status: getServerStatus(meta.name),
       localIp,
-      tunnelAddress: tunnel?.address || null,
-      tunnelStatus: tunnel ? 'active' : 'idle',
+      tunnelAddress: tunnel?.address || (meta.subdomain ? `${meta.subdomain}.s.borgov.dev` : null),
+      tunnelStatus: tunnel ? tunnel.status : 'idle',
       tunnelStrategy: tunnel?.strategy || null,
-      autoExpose: meta.autoExpose,
+      tunnelClaimUrl: null,
+      diskSize: calculateServerDiskSize(meta.name),
+      autoExpose: meta.autoExpose !== false,
       subdomain: meta.subdomain,
+      domain: meta.subdomain ? `${meta.subdomain}.s.borgov.dev` : undefined,
+      activeBackup: hasActiveBackup
+        ? {
+            status: activeBackupState.status,
+            progress: activeBackupState.progress,
+            activeType: activeBackupState.activeType,
+          }
+        : null,
+      activeFileUpload: isServerFileUploadActive(meta.name),
       ...(sharedPermissions ? { sharedPermissions } : {}),
     });
   }
@@ -804,6 +898,17 @@ export async function sendServersList(channel?: any) {
   );
   // #endregion
   channel.send(JSON.stringify({ type: 'servers_list', servers: serverData }));
+  if (activeBackupState.status !== 'idle') {
+    try {
+      channel.send(JSON.stringify({
+        type: 'backup_status',
+        status: activeBackupState.status,
+        progress: activeBackupState.progress,
+        activeType: activeBackupState.activeType,
+        server: activeBackupState.server,
+      }));
+    } catch {}
+  }
 }
 
 export async function broadcastServersList() {
@@ -821,6 +926,7 @@ function checkPeerActionAllowed(peerUid: string, payload: any): boolean {
     action === 'refresh_auth' ||
     action === 'get_host_info' ||
     action === 'get_versions' ||
+    action === 'get_platform_versions' ||
     action === 'get_loader_builds' ||
     action === 'get_java_versions' ||
     action === 'list_servers' ||
@@ -835,6 +941,9 @@ function checkPeerActionAllowed(peerUid: string, payload: any): boolean {
   if (
     action === 'create_server' ||
     action === 'delete_server' ||
+    action === 'reinstall_server' ||
+    action === 'freeze_server' ||
+    action === 'unfreeze_server' ||
     action === 'rename_server' ||
     action === 'import_server' ||
     action === 'import_upload_start' ||
@@ -918,6 +1027,7 @@ function checkPeerActionAllowed(peerUid: string, payload: any): boolean {
     case 'archive_action':
     case 'upload_start':
     case 'upload_chunk':
+    case 'cancel_upload':
     case 'restore_trash_item':
     case 'delete_trash_item_permanent':
     case 'empty_trash':
@@ -944,6 +1054,7 @@ function checkPeerActionAllowed(peerUid: string, payload: any): boolean {
     case 'set_server_ram':
     case 'set_server_startup':
     case 'get_java_runtimes':
+    case 'set_server_meta':
       return hasServerPerm(peerUid, srv, 'canProperties');
 
     case 'get_crash_history':
@@ -993,10 +1104,18 @@ function checkPeerActionAllowed(peerUid: string, payload: any): boolean {
     case 'set_local_backup_limit':
     case 'save_local_backup_limit':
     case 'cancel_backup':
+    case 'get_server_backup_dir':
+    case 'set_server_backup_dir':
+    case 'get_system_drives':
+    case 'browse_directories':
+    case 'create_directory':
       return hasServerPerm(peerUid, srv, 'canBackups');
 
     case 'start_tunnel':
     case 'stop_tunnel':
+    case 'regenerate_subdomain':
+    case 'set_custom_subdomain':
+    case 'check_subdomain_availability':
     case 'get_tunnel_status':
     case 'set_networking_settings':
     case 'install_playit':
@@ -1026,13 +1145,53 @@ function checkPeerActionAllowed(peerUid: string, payload: any): boolean {
   }
 }
 
+const FROZEN_BLOCKED_ACTIONS = new Set([
+  'write_file', 'files_write', 'create_file', 'files_create', 'create_folder', 'files_mkdir', 'create_directory',
+  'delete_file', 'files_delete', 'rename_file', 'files_rename', 'upload_file', 'upload_file_chunk',
+  'upload_start', 'upload_chunk', 'upload_finish', 'move_file', 'files_move', 'copy_file', 'files_copy',
+  'unzip_file', 'files_unzip', 'zip_files', 'files_zip', 'file_action', 'archive_action', 'trash_action',
+  'restore_trash_item', 'delete_trash_item_permanent', 'empty_trash', 'set_trash_retention',
+  'install_plugin', 'uninstall_plugin', 'delete_plugin', 'toggle_plugin', 'enable_plugin', 'disable_plugin',
+  'install_mod', 'uninstall_mod', 'delete_mod', 'toggle_mod', 'enable_mod', 'disable_mod',
+  'create_backup', 'create_local_backup', 'create_cloud_backup', 'restore_backup', 'restore_local_backup',
+  'restore_cloud_backup', 'delete_backup', 'delete_local_backup', 'delete_cloud_backup',
+  'set_server_backup_dir', 'cancel_backup', 'save_backup_config', 'set_backup_config',
+  'set_local_backup_limit', 'save_local_backup_limit',
+  'start', 'start_server', 'stop', 'stop_server', 'restart', 'restart_server', 'kill', 'kill_server',
+  'command', 'send_command',
+  'save_properties', 'set_properties', 'set_motd', 'set_server_icon', 'set_icon', 'set_eula',
+  'set_server_ram', 'set_server_startup', 'set_server_meta', 'reinstall_server',
+  'change_subdomain', 'release_subdomain', 'generate_subdomain', 'regenerate_subdomain', 'regenerate_ip',
+  'set_custom_subdomain', 'start_expose', 'stop_expose', 'start_tunnel', 'stop_tunnel', 'set_networking_settings',
+  'create_dns_subdomain', 'delete_dns_subdomain',
+  'update_status_settings', 'set_status_page_settings', 'save_status_config',
+  'op', 'op_player', 'deop', 'deop_player', 'kick', 'kick_player', 'ban', 'ban_player', 'unban', 'unban_player',
+  'whitelist_add', 'whitelist_remove', 'whitelist_on', 'whitelist_off', 'player_action',
+  'schedule_add', 'schedule_delete', 'schedule_toggle', 'schedule_save', 'delete_schedule',
+  'run_schedule_now', 'schedule_logs_clear', 'create_schedule', 'update_schedule',
+  'rename_server',
+  'delete_chunks', 'delete_regions', 'trim_world', 'reset_dimension', 'delete_world',
+  'start_map_watcher', 'stop_map_watcher', 'render_map', 'force_map_refresh',
+  'import_server', 'import_world_start', 'install_spark', 'upload_mclogs', 'freeze_server'
+]);
+
+const BACKUP_LOCKED_ACTIONS = new Set([
+  ...FROZEN_BLOCKED_ACTIONS,
+  'delete_server',
+  'unfreeze_server',
+  'generate_status_id'
+]);
+BACKUP_LOCKED_ACTIONS.delete('cancel_backup');
+
 async function handleClientMessage(channel: any, message: string, transfers: Map<string, any>) {
   try {
     const payload = JSON.parse(message);
-    // Normalize server name field — client sends `server`, daemon expects `name`
+    // Normalize server name field — client sends `server`, daemon expects `name`.
+    // Do not overwrite payload.name if this is a file upload or player detail action where `name` is the file or player name.
+    const isNameNonServerAction = payload.action === 'upload_start' || payload.action === 'get_player_detail';
     if (!payload.name && payload.server) payload.name = payload.server;
     if (!payload.name && payload.serverName) payload.name = payload.serverName;
-    if (!payload.server && payload.name) payload.server = payload.name;
+    if (!payload.server && payload.name && !isNameNonServerAction) payload.server = payload.name;
     if (!payload.oldName && (payload.server || payload.name)) payload.oldName = payload.server ?? payload.name;
     console.log(`[WebRTC] Incoming Action: ${payload.action}`, payload);
 
@@ -1041,6 +1200,56 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       if (!checkPeerActionAllowed(peerUid, payload)) {
         channel.send(JSON.stringify({ type: 'error', message: 'Permission denied for this action.' }));
         return;
+      }
+    }
+
+    // Accurately resolve target server name across all action variants
+    const targetServer = payload.action === 'rename_server'
+      ? (payload.oldName || payload.server || payload.serverName || payload.name)
+      : (payload.server || payload.serverName || (isNameNonServerAction ? undefined : payload.name) || payload.oldName);
+
+    if (targetServer) {
+      let targetMeta = getServerMeta(targetServer);
+      if (!targetMeta) {
+        targetMeta = listServers().find(s => s.name.toLowerCase() === String(targetServer).toLowerCase()) || null;
+      }
+      if (targetMeta?.isFrozen && FROZEN_BLOCKED_ACTIONS.has(payload.action)) {
+        channel.send(JSON.stringify({
+          type: 'error',
+          message: `Server "${targetServer}" is frozen in cold storage. Mutating actions (file writes, deletes, uploads, backups, plugins, mods, player management) are disabled. Unfreeze the server first.`
+        }));
+        return;
+      }
+
+      const isReadOnlyTrashList = payload.action === 'trash_action' && payload.trashAction === 'list';
+
+      if (isServerBackupActive(String(targetServer))) {
+        if (!isReadOnlyTrashList && BACKUP_LOCKED_ACTIONS.has(payload.action)) {
+          channel.send(JSON.stringify({
+            type: 'error',
+            code: 'SERVER_BUSY_BACKUP',
+            preserveBackupState: true,
+            message: `Server "${targetServer}" is currently ${activeBackupState.status} a backup (${activeBackupState.progress}%). All actions are disabled until it finishes or is cancelled.`
+          }));
+          return;
+        }
+      }
+
+      if (isServerFileUploadActive(String(targetServer))) {
+        const isUploadLifecycleAction =
+          payload.action === 'upload_start' ||
+          payload.action === 'upload_chunk' ||
+          payload.action === 'upload_finish' ||
+          payload.action === 'cancel_upload';
+        if (!isUploadLifecycleAction && !isReadOnlyTrashList && BACKUP_LOCKED_ACTIONS.has(payload.action)) {
+          channel.send(JSON.stringify({
+            type: 'error',
+            code: 'SERVER_BUSY_UPLOAD',
+            preserveBackupState: true,
+            message: `Server "${targetServer}" has an active file upload in progress. All actions are disabled until the upload finishes or is cancelled.`
+          }));
+          return;
+        }
       }
     }
     switch (payload.action) {
@@ -1081,11 +1290,33 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             await startServer(targetServer);
             console.log(`[WebRTC] startServer completed for: ${name}`);
             
-            // Auto Expose check
-            if (targetServer.autoExpose && targetServer.subdomain) {
+            // Auto Expose check (enabled by default for all servers - auto-generate subdomain if missing)
+            if (!targetServer.subdomain) {
+              const usedSubs = new Set(
+                listServers()
+                  .map(s => s.subdomain?.toLowerCase())
+                  .filter((s): s is string => Boolean(s))
+              );
+              targetServer.subdomain = generateRandomSubdomain(usedSubs);
+              targetServer.autoExpose = true;
+              if (!targetServer.statusId || targetServer.statusId === targetServer.subdomain) {
+                targetServer.statusId = slugifyServerName(targetServer.name);
+              }
+              saveServerMeta(targetServer);
+            } else if (!targetServer.statusId || targetServer.statusId === targetServer.subdomain) {
+              targetServer.statusId = slugifyServerName(targetServer.name);
+              saveServerMeta(targetServer);
+            }
+
+            if (targetServer.autoExpose !== false && targetServer.subdomain) {
               console.log(`[WebRTC] Triggering auto-exposure for ${name} on subdomain ${targetServer.subdomain}`);
               startExpose(name, targetServer.port, targetServer.subdomain, (event) => {
-                channel.send(JSON.stringify({ ...event, type: 'tunnel_event', serverName: name }));
+                if (channel.readyState === 'open') {
+                  channel.send(JSON.stringify({ ...event, serverName: name }));
+                }
+                if (event.type === 'tunnel_active' || event.type === 'tunnel_claim_needed' || event.type === 'tunnel_error') {
+                  void sendServersList(channel);
+                }
               }).catch(console.error);
             }
 
@@ -1109,13 +1340,11 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
       
       case 'generate_status_id': {
-        const { serverName, statusId: clientStatusId } = payload;
+        const { serverName } = payload;
         const meta = getServerMeta(serverName);
         if (meta) {
-          if (!meta.statusId) {
-            meta.statusId = clientStatusId || (Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10));
-            saveServerMeta(meta);
-          }
+          meta.statusId = slugifyServerName(meta.name);
+          saveServerMeta(meta);
           channel.send(JSON.stringify({ action: 'status_id_generated', serverName, statusId: meta.statusId }));
         } else {
           channel.send(JSON.stringify({ action: 'error', message: `Server "${serverName}" not found` }));
@@ -1125,52 +1354,29 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'set_status_page_settings': {
         const { serverName, ...settings } = payload;
-        const meta = getServerMeta(serverName);
+        const meta = serverName ? getServerMeta(serverName) : null;
         if (meta) {
-          if (settings.statusId !== undefined && settings.statusId !== meta.statusId) {
-            const db = getDb();
-            try {
-              const existingRef = doc(db, 'server_status', settings.statusId);
-              const existingSnap = await getDoc(existingRef);
-              if (existingSnap.exists() && existingSnap.data().name !== meta.name) {
-                channel.send(JSON.stringify({ action: 'error', message: `Custom ID "${settings.statusId}" is already taken by another server` }));
-                break;
-              }
-            } catch {}
-            meta.statusId = settings.statusId;
-            saveServerMeta(meta);
-            try {
-              await restCommit([{
-                update: {
-                  name: docName(`server_status/${settings.statusId}`),
-                  fields: {
-                    name: { stringValue: meta.name },
-                    online: { booleanValue: false },
-                    status: { stringValue: 'offline' },
-                    playerCount: { integerValue: '0' },
-                    maxPlayers: { integerValue: '20' },
-                    version: { stringValue: meta.version },
-                    serverType: { stringValue: meta.type },
-                    motd: { stringValue: 'Loading...' },
-                    ip: { stringValue: '' },
-                    port: { integerValue: String(meta.port) },
-                    showIp: { booleanValue: meta.statusPageShowIp ?? false },
-                    theme: { stringValue: settings.theme || 'default' },
-                    description: { stringValue: settings.description || '' },
-                    lastUpdated: { stringValue: new Date().toISOString() },
-                  },
-                },
-              }]);
-            } catch {}
+          if (settings.showIp !== undefined) meta.statusPageShowIp = Boolean(settings.showIp);
+          if (settings.isPublic !== undefined) meta.isPublic = Boolean(settings.isPublic);
+          if (settings.theme !== undefined) meta.statusPageTheme = String(settings.theme);
+          if (settings.description !== undefined) meta.statusPageDescription = String(settings.description);
+          if (settings.subdomain) {
+            meta.subdomain = String(settings.subdomain).trim().toLowerCase();
           }
-          if (settings.showIp !== undefined) meta.statusPageShowIp = settings.showIp;
-          if (settings.theme !== undefined) meta.statusPageTheme = settings.theme;
-          if (settings.description !== undefined) meta.statusPageDescription = settings.description;
+          if (!meta.statusId || meta.statusId === meta.subdomain) {
+            meta.statusId = slugifyServerName(meta.name);
+          }
           saveServerMeta(meta);
-          channel.send(JSON.stringify({ action: 'status_page_settings_saved', serverName }));
+
+          // Immediately push to Firestore
+          try {
+            void updateAllServerStatusPages();
+          } catch {}
+
+          channel.send(JSON.stringify({ type: 'action_success', action: 'Status page settings saved', serverName }));
           await sendServersList(channel);
         } else {
-          channel.send(JSON.stringify({ action: 'error', message: `Server "${serverName}" not found` }));
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${serverName}" not found` }));
         }
         break;
       }
@@ -1204,13 +1410,25 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             console.warn('[WebRTC] Could not send initial install_progress:', sendErr);
           }
 
-          const port = serverOpts.port || getNextAvailablePort();
-          const statusId = Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10);
+          const defaultPortStart = String(serverOpts.type || '').toLowerCase() === 'bedrock' ? 19132 : 25565;
+          const port = serverOpts.port || getNextAvailablePort(defaultPortStart);
+          const usedSubdomains = new Set(
+            listServers()
+              .map(s => s.subdomain?.toLowerCase())
+              .filter((s): s is string => Boolean(s))
+          );
+          const assignedSubdomain =
+            serverOpts.subdomain && isValidSubdomain(String(serverOpts.subdomain).trim().toLowerCase())
+              ? String(serverOpts.subdomain).trim().toLowerCase()
+              : generateRandomSubdomain(usedSubdomains);
+
           const meta = {
             ...serverOpts,
             port,
             createdAt: new Date().toISOString(),
-            statusId,
+            statusId: assignedSubdomain,
+            subdomain: assignedSubdomain,
+            autoExpose: serverOpts.autoExpose ?? true,
           };
           
           await installServer(meta, (progress) => {
@@ -1261,12 +1479,16 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'stop_server': {
         stopServer(payload.name);
+        await stopExpose(payload.name).catch(() => {});
+        channel.send(JSON.stringify({ type: 'tunnel_stopped', serverName: payload.name }));
         await sendServersList(channel);
         break;
       }
 
       case 'kill_server': {
         killServer(payload.name);
+        await stopExpose(payload.name).catch(() => {});
+        channel.send(JSON.stringify({ type: 'tunnel_stopped', serverName: payload.name }));
         await sendServersList(channel);
         break;
       }
@@ -1275,31 +1497,283 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         const { name } = payload;
         if (isRunning(name)) killServer(name);
         // Auto-delete DNS for tunnel if server had one
+        const meta = getServerMeta(name);
         const tunnelState = getTunnelState(name);
-        if (tunnelState) {
-          stopExpose(name, tunnelState.subdomain).catch(console.error);
+        const subToCleanup = tunnelState?.subdomain || meta?.subdomain;
+        await stopExpose(name, subToCleanup).catch(console.error);
+
+        // Purge local backups
+        try {
+          const backupsDir = getLocalBackupsDir(name);
+          if (fs.existsSync(backupsDir)) {
+            fs.rmSync(backupsDir, { recursive: true, force: true });
+            console.log(`[WebRTC] Purged local backups directory for "${name}"`);
+          }
+        } catch (err) {
+          console.warn('[WebRTC] Error deleting local backups:', err);
         }
+
+        // Purge cloud backups in BackupHub
+        try {
+          const { backupServerUrl, backupToken } = loadBackupConfig();
+          const daemonId = getDaemonId();
+          if (backupServerUrl && backupToken) {
+            await fetch(`${backupServerUrl}/api/backup/server`, {
+              method: 'DELETE',
+              headers: {
+                'Authorization': `Bearer ${backupToken}`,
+                'Content-Type': 'application/json',
+              },
+              body: JSON.stringify({ nodeId: daemonId, serverId: name }),
+            });
+            console.log(`[WebRTC] Successfully requested BackupHub to purge all cloud backups for "${name}"`);
+          }
+        } catch (hubErr) {
+          console.warn('[WebRTC] BackupHub cloud backup purge notice:', hubErr);
+        }
+
         deleteServer(name);
         await sendServersList(channel);
         channel.send(JSON.stringify({ type: 'action_success', action: `Server ${name} deleted successfully` }));
         break;
       }
 
+      case 'freeze_server': {
+        const server = payload.server || payload.name;
+        const meta = getServerMeta(server);
+        if (!meta) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${server}" not found` }));
+          break;
+        }
+        if (meta.isFrozen) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${server}" is already frozen` }));
+          break;
+        }
+
+        try {
+          channel.send(JSON.stringify({ type: 'action_info', action: `Freezing server "${server}"... stopping processes.` }));
+
+          // 1. Stop if running
+          if (isRunning(server)) {
+            killServer(server);
+            await waitForServerStop(server).catch(() => {});
+          }
+
+          // 2. Stop expose / tunnel
+          const tunnelState = getTunnelState(server);
+          const subToCleanup = tunnelState?.subdomain || meta?.subdomain;
+          await stopExpose(server, subToCleanup).catch(() => {});
+
+          // Release subdomain from DNS & Broker so others can claim it
+          if (meta.subdomain) {
+            try {
+              await deleteTunnelDns(meta.subdomain);
+            } catch (dnsErr) {
+              console.warn('[FREEZE] Error deleting DNS for subdomain:', dnsErr);
+            }
+            meta.previousSubdomain = meta.subdomain;
+            delete meta.subdomain;
+            saveServerMeta(meta);
+          }
+
+          // Terminate any active in-flight transfers targeting this server
+          const activeServerDir = getServerDir(server);
+          for (const [sId, t] of transfers.entries()) {
+            if (t?.path && (t.path === activeServerDir || t.path.startsWith(activeServerDir + path.sep) || t.path.startsWith(activeServerDir + '/'))) {
+              try { t.writeStream?.end(); } catch {}
+              transfers.delete(sId);
+            }
+          }
+
+          // 3. Purge all local backups
+          const backupsDir = getLocalBackupsDir(server);
+          if (fs.existsSync(backupsDir)) {
+            try {
+              fs.rmSync(backupsDir, { recursive: true, force: true });
+            } catch (delErr) {
+              console.warn('[FREEZE] Error purging local backups:', delErr);
+            }
+          }
+
+          // 4. Purge all cloud backups in BackupHub
+          const { backupServerUrl, backupToken } = loadBackupConfig();
+          const daemonId = getDaemonId();
+          if (backupServerUrl && backupToken) {
+            try {
+              await fetch(`${backupServerUrl}/api/backup/server`, {
+                method: 'DELETE',
+                headers: {
+                  'Authorization': `Bearer ${backupToken}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ nodeId: daemonId, serverId: server }),
+              });
+              console.log(`[FREEZE] Purged cloud backups from BackupHub for "${server}"`);
+            } catch (hubErr) {
+              console.warn('[FREEZE] BackupHub purge notice:', hubErr);
+            }
+          }
+
+          // 5. Compress server directory into frozen_archive.zip
+          const serverDir = getServerDir(server);
+          const tempArchive = path.join(os.tmpdir(), `void_freeze_${server}_${Date.now()}.zip`);
+          const finalArchive = path.join(serverDir, 'frozen_archive.zip');
+
+          channel.send(JSON.stringify({ type: 'action_info', action: `Compressing files for "${server}"...` }));
+          await compressFolder(serverDir, tempArchive, undefined, undefined, backupsDir);
+
+          if (!fs.existsSync(tempArchive) || fs.statSync(tempArchive).size === 0) {
+            throw new Error('Compression failed: output archive is missing or empty.');
+          }
+
+          // Move temp archive to server folder safely across drives (handles EXDEV)
+          try {
+            fs.renameSync(tempArchive, finalArchive);
+          } catch (mvErr: any) {
+            if (mvErr.code === 'EXDEV' || String(mvErr?.message || '').includes('cross-device')) {
+              fs.copyFileSync(tempArchive, finalArchive);
+              try { fs.unlinkSync(tempArchive); } catch {}
+            } else {
+              throw mvErr;
+            }
+          }
+
+          if (!fs.existsSync(finalArchive) || fs.statSync(finalArchive).size === 0) {
+            throw new Error('Failed to verify frozen archive in server directory.');
+          }
+
+          const archiveStat = fs.statSync(finalArchive);
+
+          // Only after the archive is safely verified, delete files in serverDir EXCEPT meta.json and frozen_archive.zip
+          const entries = fs.readdirSync(serverDir);
+          for (const entry of entries) {
+            if (entry === 'meta.json' || entry === 'frozen_archive.zip') continue;
+            const fullP = path.join(serverDir, entry);
+            try {
+              fs.rmSync(fullP, { recursive: true, force: true });
+            } catch (delErr) {
+              console.warn(`[FREEZE] Could not remove file during freeze: ${entry}`, delErr);
+            }
+          }
+
+          meta.isFrozen = true;
+          meta.frozenAt = Date.now();
+          meta.frozenArchiveSize = archiveStat.size;
+          saveServerMeta(meta);
+
+          // Update status page immediately to reflect frozen state
+          await setServerFrozenStatus(meta).catch(() => {});
+
+          invalidateServerDiskCache(server);
+          await sendServersList(channel);
+          channel.send(JSON.stringify({
+            type: 'freeze_server_success',
+            server,
+            archiveSize: archiveStat.size,
+          }));
+          channel.send(JSON.stringify({
+            type: 'action_success',
+            action: `Server "${server}" is now FROZEN. Storage compressed, network IP released, and all backups purged.`,
+          }));
+        } catch (err: any) {
+          console.error(`[FREEZE] Server freeze failed:`, err);
+          channel.send(JSON.stringify({ type: 'error', message: `Freeze failed: ${err.message}` }));
+        }
+        break;
+      }
+
+      case 'unfreeze_server': {
+        const server = payload.server || payload.name;
+        const meta = getServerMeta(server);
+        if (!meta) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${server}" not found` }));
+          break;
+        }
+        if (!meta.isFrozen) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${server}" is not frozen` }));
+          break;
+        }
+
+        const serverDir = getServerDir(server);
+        const archivePath = path.join(serverDir, 'frozen_archive.zip');
+        if (!fs.existsSync(archivePath)) {
+          channel.send(JSON.stringify({ type: 'error', message: 'Frozen archive file (frozen_archive.zip) not found on host machine!' }));
+          break;
+        }
+
+        try {
+          channel.send(JSON.stringify({ type: 'action_info', action: `Unfreezing "${server}"... extracting files.` }));
+          await extractArchive(archivePath, serverDir);
+          try {
+            fs.unlinkSync(archivePath);
+          } catch {}
+
+          meta.isFrozen = false;
+          delete meta.frozenAt;
+          delete meta.frozenArchiveSize;
+          delete meta.previousSubdomain;
+
+          if (!meta.subdomain) {
+            const used = new Set(listServers().map(s => s.subdomain?.toLowerCase()).filter(Boolean) as string[]);
+            meta.subdomain = generateRandomSubdomain(used);
+            meta.statusId = slugifyServerName(meta.name);
+          }
+          saveServerMeta(meta);
+
+          invalidateServerDiskCache(server);
+          await sendServersList(channel);
+          await updateAllServerStatusPages().catch(() => {});
+
+          channel.send(JSON.stringify({
+            type: 'unfreeze_server_success',
+            server,
+          }));
+          channel.send(JSON.stringify({
+            type: 'action_success',
+            action: `Server "${server}" successfully unfrozen and restored!`,
+          }));
+        } catch (err: any) {
+          console.error(`[UNFREEZE] Server unfreeze failed:`, err);
+          channel.send(JSON.stringify({ type: 'error', message: `Unfreeze failed: ${err.message}` }));
+        }
+        break;
+      }
+
       case 'start_tunnel': {
         const { serverName, subdomain } = payload;
-        if (!isValidSubdomain(subdomain)) {
+        const server = listServers().find(s => s.name === serverName);
+        if (!server) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${serverName}" not found` }));
+          break;
+        }
+        const chosenSubdomain =
+          (subdomain && String(subdomain).trim().toLowerCase()) ||
+          server.subdomain ||
+          generateRandomSubdomain();
+
+        if (!isValidSubdomain(chosenSubdomain)) {
           channel.send(JSON.stringify({ type: 'error', message: 'Invalid subdomain format' }));
           break;
         }
-        const server = listServers().find(s => s.name === serverName);
-        if (server) {
-          startExpose(serverName, server.port, subdomain, (event) => {
-            channel.send(JSON.stringify({ ...event, type: 'tunnel_event', serverName }));
-          }).catch(err => {
-            console.error('[WebRTC] startExpose Error:', err);
-            channel.send(JSON.stringify({ type: 'tunnel_event', type_orig: 'tunnel_error', serverName, payload: { message: err.message } }));
-          });
-        }
+
+        server.subdomain = chosenSubdomain;
+        server.autoExpose = true;
+        saveServerMeta(server);
+
+        startExpose(serverName, server.port, chosenSubdomain, (event) => {
+          if (channel.readyState === 'open') {
+            channel.send(JSON.stringify({ ...event, serverName }));
+          }
+          if (event.type === 'tunnel_active' || event.type === 'tunnel_claim_needed' || event.type === 'tunnel_error') {
+            void sendServersList(channel);
+          }
+        }).catch(err => {
+          console.error('[WebRTC] startExpose Error:', err);
+          if (channel.readyState === 'open') {
+            channel.send(JSON.stringify({ type: 'tunnel_error', serverName, payload: { message: err.message } }));
+          }
+        });
+        await sendServersList(channel);
         break;
       }
 
@@ -1307,6 +1781,139 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         const { serverName, subdomain } = payload;
         await stopExpose(serverName, subdomain);
         channel.send(JSON.stringify({ type: 'tunnel_stopped', serverName }));
+        await sendServersList(channel);
+        break;
+      }
+
+      case 'regenerate_subdomain': {
+        const serverName = payload.serverName || payload.name;
+        const meta = serverName ? getServerMeta(serverName) : null;
+        if (!meta) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${serverName || ''}" not found` }));
+          break;
+        }
+
+        const oldSubdomain = meta.subdomain;
+        const usedSubs = new Set(
+          listServers()
+            .map(s => s.subdomain?.toLowerCase())
+            .filter((s): s is string => Boolean(s))
+        );
+        if (oldSubdomain) usedSubs.add(oldSubdomain.toLowerCase());
+
+        const newSubdomain = generateRandomSubdomain(usedSubs);
+        meta.subdomain = newSubdomain;
+        meta.autoExpose = true;
+        saveServerMeta(meta);
+
+        const wasExposed = Boolean(getTunnelState(meta.name));
+        const runningNow = isRunning(meta.name);
+
+        if (wasExposed) {
+          await stopExpose(meta.name, oldSubdomain).catch(() => {});
+        } else if (oldSubdomain) {
+          void deleteTunnelDns(oldSubdomain);
+        }
+
+        const newDomain = `${newSubdomain}.${VOID_DOMAIN}`;
+        channel.send(JSON.stringify({
+          type: 'subdomain_regenerated',
+          serverName: meta.name,
+          subdomain: newSubdomain,
+          domain: newDomain,
+        }));
+        channel.send(JSON.stringify({
+          type: 'action_success',
+          action: `New server IP assigned: ${newDomain}`,
+        }));
+
+        if (wasExposed || runningNow) {
+          startExpose(meta.name, meta.port, newSubdomain, (event) => {
+            if (channel.readyState === 'open') {
+              channel.send(JSON.stringify({ ...event, serverName: meta.name }));
+            }
+            if (event.type === 'tunnel_active' || event.type === 'tunnel_claim_needed' || event.type === 'tunnel_error') {
+              void sendServersList(channel);
+            }
+          }).catch(console.error);
+        }
+
+        await sendServersList(channel);
+        break;
+      }
+
+      case 'set_custom_subdomain': {
+        const serverName = payload.serverName || payload.name;
+        const meta = serverName ? getServerMeta(serverName) : null;
+        if (!meta) {
+          channel.send(JSON.stringify({ type: 'error', message: `Server "${serverName || ''}" not found` }));
+          break;
+        }
+
+        const rawSub = String(payload.subdomain || '').trim().toLowerCase();
+        if (containsDisallowedWords(rawSub)) {
+          channel.send(JSON.stringify({ type: 'error', message: 'This subdomain contains disallowed or sensitive words.' }));
+          break;
+        }
+        if (!isValidSubdomain(rawSub)) {
+          channel.send(JSON.stringify({ type: 'error', message: 'Invalid subdomain format' }));
+          break;
+        }
+
+        const oldSubdomain = meta.subdomain;
+        meta.subdomain = rawSub;
+        if (!meta.statusId || meta.statusId === oldSubdomain) {
+          meta.statusId = slugifyServerName(meta.name);
+        }
+        saveServerMeta(meta);
+
+        const wasExposed = Boolean(getTunnelState(meta.name));
+        const runningNow = isRunning(meta.name);
+
+        if (wasExposed) {
+          await stopExpose(meta.name, oldSubdomain).catch(() => {});
+        } else if (oldSubdomain && oldSubdomain !== rawSub) {
+          void deleteTunnelDns(oldSubdomain);
+        }
+
+        // Only create DNS / tunnel if server is actively running!
+        if (runningNow) {
+          startExpose(meta.name, meta.port, rawSub, (event) => {
+            if (channel.readyState === 'open') {
+              channel.send(JSON.stringify({ ...event, serverName: meta.name }));
+            }
+            if (event.type === 'tunnel_active' || event.type === 'tunnel_claim_needed' || event.type === 'tunnel_error') {
+              void sendServersList(channel);
+            }
+          }).catch(console.error);
+        }
+
+        const newDomain = `${rawSub}.${VOID_DOMAIN}`;
+        channel.send(JSON.stringify({
+          type: 'subdomain_regenerated',
+          serverName: meta.name,
+          subdomain: rawSub,
+          domain: newDomain,
+        }));
+        channel.send(JSON.stringify({
+          type: 'action_success',
+          action: `Server address prefix updated to "${rawSub}"${runningNow ? '' : ' (will activate when server is started)'}`,
+        }));
+
+        await sendServersList(channel);
+        break;
+      }
+
+      case 'set_server_meta': {
+        const { serverName, autoRestart, ...otherMeta } = payload;
+        const meta = serverName ? getServerMeta(serverName) : null;
+        if (meta) {
+          if (autoRestart !== undefined) meta.autoRestart = Boolean(autoRestart);
+          Object.assign(meta, otherMeta);
+          saveServerMeta(meta);
+          await sendServersList(channel);
+          channel.send(JSON.stringify({ type: 'action_success', action: 'Server configuration saved' }));
+        }
         break;
       }
 
@@ -1315,7 +1922,18 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         const meta = getServerMeta(serverName);
         if (meta) {
           meta.autoExpose = autoExpose;
-          if (subdomain) meta.subdomain = subdomain;
+          if (subdomain) {
+            const cleanSub = String(subdomain).trim().toLowerCase();
+            if (containsDisallowedWords(cleanSub)) {
+              channel.send(JSON.stringify({ type: 'error', message: 'This subdomain contains disallowed or sensitive words.' }));
+              break;
+            }
+            if (!isValidSubdomain(cleanSub)) {
+              channel.send(JSON.stringify({ type: 'error', message: 'Invalid subdomain format' }));
+              break;
+            }
+            meta.subdomain = cleanSub;
+          }
           saveServerMeta(meta);
           await sendServersList(channel);
           channel.send(JSON.stringify({ type: 'action_success', action: 'Networking preferences saved' }));
@@ -1340,7 +1958,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
       case 'get_versions': {
         try {
-          const [vanillaRes, paperRes, fabricRes, forgeRes, purpurRes, neoforgeRes, quiltRes, arclightRaw] = await Promise.all([
+          const [vanillaRes, paperRes, fabricRes, forgeRes, purpurRes, neoforgeRes, quiltRes, arclightRaw, bedrockRes] = await Promise.all([
             getVanillaReleases().then(v => v.map(x => x.id)).catch(() => [] as string[]),
             getPaperVersions().catch(() => [] as string[]),
             getFabricGameVersions(50).catch(() => [] as string[]),
@@ -1349,6 +1967,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             getNeoForgeGameVersions(50).catch(() => [] as string[]),
             getQuiltGameVersions(50).catch(() => [] as string[]),
             getArclightVersions().catch(() => []),
+            getBedrockVersions().catch(() => [] as string[]),
           ]);
           const vanilla = Array.isArray(vanillaRes) ? vanillaRes : [];
           const paper = Array.isArray(paperRes) ? paperRes : [];
@@ -1361,6 +1980,9 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           const arclight = arclightExtracted.length > 0
             ? arclightExtracted
             : ['1.21.1', '1.20.4', '1.20.1', '1.19.2', '1.18.2', '1.16.5'];
+          const bedrock = Array.isArray(bedrockRes) && bedrockRes.length > 0
+            ? bedrockRes
+            : ['1.21.62.01', '1.21.61.01', '1.21.60.10'];
 
           channel.send(JSON.stringify({ 
             type: 'versions_manifest', 
@@ -1372,9 +1994,140 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             neoforge: neoforge.slice(0, 50),
             quilt: quilt.slice(0, 50),
             arclight: arclight.slice(0, 50),
+            bedrock: bedrock.slice(0, 50),
           }));
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: `Fetch failed: ${err.message}` }));
+        }
+        break;
+      }
+
+      case 'get_platform_versions': {
+        const { platform } = payload;
+        try {
+          let versions: string[] = [];
+          if (platform === 'paper') {
+            versions = await getPaperVersions();
+          } else if (platform === 'purpur') {
+            versions = await getPurpurVersions();
+          } else if (platform === 'fabric') {
+            versions = await getFabricGameVersions(200);
+          } else if (platform === 'vanilla') {
+            versions = (await getVanillaReleases()).map(x => x.id);
+          } else if (platform === 'forge') {
+            versions = await getForgeGameVersions(200);
+          } else if (platform === 'neoforge') {
+            versions = await getNeoForgeGameVersions(200);
+          } else if (platform === 'quilt') {
+            versions = await getQuiltGameVersions(200);
+          } else if (platform === 'arclight') {
+            const raw = await getArclightVersions();
+            versions = Array.from(new Set(raw.map(v => v.version)));
+            if (versions.length === 0) {
+              versions = ['1.21.1', '1.20.4', '1.20.1', '1.19.2', '1.18.2', '1.16.5'];
+            }
+          } else if (platform === 'bedrock') {
+            versions = await getBedrockVersions();
+          } else {
+            const [vanillaRes, paperRes, fabricRes, forgeRes, purpurRes, neoforgeRes, quiltRes, arclightRaw, bedrockRes] = await Promise.all([
+              getVanillaReleases().then(v => v.map(x => x.id)).catch(() => [] as string[]),
+              getPaperVersions().catch(() => [] as string[]),
+              getFabricGameVersions(200).catch(() => [] as string[]),
+              getForgeGameVersions(200).catch(() => [] as string[]),
+              getPurpurVersions().catch(() => [] as string[]),
+              getNeoForgeGameVersions(200).catch(() => [] as string[]),
+              getQuiltGameVersions(200).catch(() => [] as string[]),
+              getArclightVersions().catch(() => []),
+              getBedrockVersions().catch(() => [] as string[]),
+            ]);
+            const arclightExtracted = Array.from(new Set(arclightRaw.map(v => v.version)));
+            channel.send(JSON.stringify({
+              type: 'platform_versions',
+              manifest: {
+                vanilla: vanillaRes,
+                paper: paperRes,
+                fabric: fabricRes,
+                forge: forgeRes,
+                purpur: purpurRes,
+                neoforge: neoforgeRes,
+                quilt: quiltRes,
+                arclight: arclightExtracted.length > 0 ? arclightExtracted : ['1.21.1', '1.20.4', '1.20.1', '1.19.2', '1.18.2', '1.16.5'],
+                bedrock: bedrockRes,
+              }
+            }));
+            break;
+          }
+
+          channel.send(JSON.stringify({
+            type: 'platform_versions',
+            platform,
+            versions,
+          }));
+        } catch (err: any) {
+          channel.send(JSON.stringify({ type: 'error', message: `Fetch platform versions failed: ${err.message}` }));
+        }
+        break;
+      }
+
+      case 'reinstall_server': {
+        const { server, platform, version, build, retentionScope, createBackup } = payload;
+        const targetServer = server || payload.name;
+        if (!targetServer || !platform || !version) {
+          channel.send(JSON.stringify({ type: 'error', message: 'Missing server name, platform, or version for reinstallation.' }));
+          break;
+        }
+
+        try {
+          console.log(`[WebRTC] Reinstalling server "${targetServer}" to ${platform} ${version} (retention: ${retentionScope || 'in_place'})...`);
+          try {
+            channel.send(JSON.stringify({
+              type: 'reinstall_progress',
+              server: targetServer,
+              stage: 'creating',
+              progress: 2,
+              message: 'Daemon accepted reinstallation request...',
+            }));
+          } catch {}
+          await reinstallServer(
+            {
+              serverName: targetServer,
+              type: platform,
+              version,
+              build: typeof build === 'number' ? build : undefined,
+              retentionScope: retentionScope || 'in_place',
+              createBackup: createBackup !== false,
+            },
+            (p) => {
+              try {
+                channel.send(JSON.stringify({
+                  type: 'reinstall_progress',
+                  server: targetServer,
+                  stage: p.stage,
+                  progress: p.progress,
+                  message: p.message,
+                  error: p.error,
+                }));
+              } catch {}
+            }
+          );
+
+          channel.send(JSON.stringify({
+            type: 'reinstall_complete',
+            server: targetServer,
+            success: true,
+            platform,
+            version,
+          }));
+
+          await broadcastServersList();
+        } catch (err: any) {
+          console.error(`[WebRTC] Reinstallation failed for ${targetServer}:`, err);
+          channel.send(JSON.stringify({
+            type: 'reinstall_complete',
+            server: targetServer,
+            success: false,
+            error: err?.message || String(err),
+          }));
         }
         break;
       }
@@ -1505,6 +2258,38 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           case 'kick': 
             if (isOnline) sendCommand(server, `kick ${player} ${reason || 'Kicked by admin'}`); 
             break;
+          case 'gamemode':
+            if (isOnline) sendCommand(server, `gamemode ${payload.gamemode || 'survival'} ${player}`);
+            break;
+          case 'kill':
+            if (isOnline) sendCommand(server, `kill ${player}`);
+            break;
+          case 'hit':
+            if (isOnline) {
+              sendCommand(server, `damage ${player} ${payload.amount || 4}`);
+            }
+            break;
+          case 'heal':
+            if (isOnline) {
+              sendCommand(server, `effect give ${player} minecraft:instant_health 1 255 true`);
+              sendCommand(server, `effect give ${player} minecraft:saturation 1 255 true`);
+            }
+            break;
+          case 'feed':
+            if (isOnline) sendCommand(server, `effect give ${player} minecraft:saturation 1 255 true`);
+            break;
+          case 'starve':
+            if (isOnline) sendCommand(server, `effect give ${player} minecraft:hunger 15 255 true`);
+            break;
+          case 'add_xp':
+            if (isOnline) sendCommand(server, `xp add ${player} ${payload.amount || 1} levels`);
+            break;
+          case 'set_level':
+            if (isOnline) sendCommand(server, `experience set ${player} ${payload.level || 0} levels`);
+            break;
+          case 'clear':
+            if (isOnline) sendCommand(server, `clear ${player}`);
+            break;
         }
         
         // Immediate sync hint
@@ -1516,6 +2301,13 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           updated.online = getOnlinePlayers(server);
           console.log(`[WebRTC] Broadcasting updated player lists for ${server}`);
           channel.send(JSON.stringify({ type: 'players_list', server, players: updated }));
+
+          if (payload.uuid) {
+            try {
+              const detail = await getPlayerDetail(server, payload.uuid, player);
+              channel.send(JSON.stringify({ type: 'player_detail', server, uuid: payload.uuid, detail }));
+            } catch {}
+          }
         }, 1200);
         break;
       }
@@ -1642,10 +2434,46 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           writeStream,
           path: fullPath,
           size,
-          received: 0
+          received: 0,
+          server
         });
+        registerActiveFileUpload(server, sessionId);
 
         channel.send(JSON.stringify({ type: 'upload_ready', sessionId, name, size }));
+        break;
+      }
+
+      case 'cancel_upload': {
+        const { server, sessionId } = payload;
+        if (sessionId && transfers.has(sessionId)) {
+          const transfer = transfers.get(sessionId);
+          try { transfer?.writeStream?.destroy(); } catch {}
+          try {
+            if (transfer?.path && fs.existsSync(transfer.path)) fs.unlinkSync(transfer.path);
+          } catch {}
+          transfers.delete(sessionId);
+          const srvName = transfer?.server || server;
+          if (srvName) unregisterActiveFileUpload(srvName, sessionId);
+        } else if (server) {
+          for (const [sid, transfer] of Array.from(transfers.entries())) {
+            if (transfer?.server?.toLowerCase() === String(server).toLowerCase()) {
+              try { transfer.writeStream?.destroy(); } catch {}
+              try {
+                if (transfer.path && fs.existsSync(transfer.path)) fs.unlinkSync(transfer.path);
+              } catch {}
+              transfers.delete(sid);
+              unregisterActiveFileUpload(transfer.server, sid);
+            }
+          }
+          // Ensure any orphaned entries for this server are cleared too
+          const leftover = activeFileUploads.get(String(server).toLowerCase());
+          if (leftover) {
+            for (const sid of Array.from(leftover)) {
+              unregisterActiveFileUpload(String(server), sid);
+            }
+          }
+        }
+        channel.send(JSON.stringify({ type: 'upload_cancelled', server, sessionId }));
         break;
       }
 
@@ -1717,6 +2545,13 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         try {
           const plugins = listPlugins(server);
           channel.send(JSON.stringify({ type: 'plugins_list', server, plugins }));
+          resolveMissingPluginMetadata(server)
+            .then((updated) => {
+              if (updated && channel.readyState === 'open') {
+                channel.send(JSON.stringify({ type: 'plugins_list', server, plugins: listPlugins(server) }));
+              }
+            })
+            .catch(() => {});
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: err.message }));
         }
@@ -1736,11 +2571,12 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'install_plugin': {
-        const { server, url, fileName } = payload;
+        const { server, url, fileName, meta } = payload;
         const root = getServerDir(server);
         const pluginsPath = path.join(root, 'plugins');
         const sanitizedFileName = fileName.replace(/[^a-z0-9.-]/gi, '_');
-        const fullPath = path.join(pluginsPath, sanitizedFileName.endsWith('.jar') ? sanitizedFileName : sanitizedFileName + '.jar');
+        const targetFileName = sanitizedFileName.endsWith('.jar') ? sanitizedFileName : sanitizedFileName + '.jar';
+        const fullPath = path.join(pluginsPath, targetFileName);
         
         try {
           if (!fs.existsSync(pluginsPath)) fs.mkdirSync(pluginsPath, { recursive: true });
@@ -1748,9 +2584,9 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           
           const download = (targetUrl: string): Promise<void> => {
             return new Promise((resolve, reject) => {
-              https.get(targetUrl, (res) => {
-                if (res.statusCode === 301 || res.statusCode === 302) {
-                  download(res.headers.location!).then(resolve).catch(reject);
+              https.get(targetUrl, { headers: { 'User-Agent': 'VoidServers/1.0' } }, (res) => {
+                if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) && res.headers.location) {
+                  download(res.headers.location).then(resolve).catch(reject);
                   return;
                 }
                 
@@ -1776,6 +2612,25 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           };
 
           await download(url);
+
+          if (meta && typeof meta === 'object') {
+            savePluginMetadata(
+              server,
+              targetFileName,
+              {
+                name: typeof meta.name === 'string' ? meta.name : undefined,
+                description: typeof meta.description === 'string' ? meta.description : undefined,
+                author: typeof meta.author === 'string' ? meta.author : undefined,
+                iconUrl: typeof meta.iconUrl === 'string' ? meta.iconUrl : typeof meta.icon_url === 'string' ? meta.icon_url : undefined,
+                version: typeof meta.version === 'string' ? meta.version : undefined,
+                source: typeof meta.source === 'string' ? meta.source : undefined,
+                projectId: typeof meta.projectId === 'string' ? meta.projectId : typeof meta.id === 'string' ? meta.id : undefined,
+              },
+              fullPath,
+            );
+          } else {
+            await resolveMissingPluginMetadata(server).catch(() => false);
+          }
           
           const plugins = listPlugins(server);
           channel.send(JSON.stringify({ type: 'plugins_list', server, plugins }));
@@ -1792,6 +2647,13 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         try {
           const mods = listMods(server);
           channel.send(JSON.stringify({ type: 'mods_list', server, mods }));
+          resolveMissingModMetadata(server)
+            .then((updated) => {
+              if (updated && channel.readyState === 'open') {
+                channel.send(JSON.stringify({ type: 'mods_list', server, mods: listMods(server) }));
+              }
+            })
+            .catch(() => {});
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: err.message }));
         }
@@ -1811,11 +2673,12 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'install_mod': {
-        const { server, url, fileName } = payload;
+        const { server, url, fileName, meta } = payload;
         const root = getServerDir(server);
         const modsPath = path.join(root, 'mods');
         const sanitizedFileName = fileName.replace(/[^a-z0-9.-]/gi, '_');
-        const fullPath = path.join(modsPath, sanitizedFileName.endsWith('.jar') ? sanitizedFileName : sanitizedFileName + '.jar');
+        const targetFileName = sanitizedFileName.endsWith('.jar') ? sanitizedFileName : sanitizedFileName + '.jar';
+        const fullPath = path.join(modsPath, targetFileName);
 
         try {
           if (!fs.existsSync(modsPath)) fs.mkdirSync(modsPath, { recursive: true });
@@ -1823,9 +2686,9 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
           const download = (targetUrl: string): Promise<void> => {
             return new Promise((resolve, reject) => {
-              https.get(targetUrl, (res) => {
-                if (res.statusCode === 301 || res.statusCode === 302) {
-                  download(res.headers.location!).then(resolve).catch(reject);
+              https.get(targetUrl, { headers: { 'User-Agent': 'VoidServers/1.0' } }, (res) => {
+                if ((res.statusCode === 301 || res.statusCode === 302 || res.statusCode === 307 || res.statusCode === 308) && res.headers.location) {
+                  download(res.headers.location).then(resolve).catch(reject);
                   return;
                 }
 
@@ -1851,6 +2714,25 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           };
 
           await download(url);
+
+          if (meta && typeof meta === 'object') {
+            saveModMetadata(
+              server,
+              targetFileName,
+              {
+                name: typeof meta.name === 'string' ? meta.name : undefined,
+                description: typeof meta.description === 'string' ? meta.description : undefined,
+                author: typeof meta.author === 'string' ? meta.author : undefined,
+                iconUrl: typeof meta.iconUrl === 'string' ? meta.iconUrl : typeof meta.icon_url === 'string' ? meta.icon_url : undefined,
+                version: typeof meta.version === 'string' ? meta.version : undefined,
+                source: typeof meta.source === 'string' ? meta.source : undefined,
+                projectId: typeof meta.projectId === 'string' ? meta.projectId : typeof meta.id === 'string' ? meta.id : undefined,
+              },
+              fullPath,
+            );
+          } else {
+            await resolveMissingModMetadata(server).catch(() => false);
+          }
 
           const mods = listMods(server);
           channel.send(JSON.stringify({ type: 'mods_list', server, mods }));
@@ -2027,6 +2909,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'create_cloud_backup': {
+        if (sendBackupBusyError(channel)) break;
         const { server } = payload;
         const daemonId = getDaemonId();
         const { backupServerUrl, backupToken } = loadBackupConfig();
@@ -2039,55 +2922,72 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         updateBackupState(server, 'zipping', 0, 'cloud');
 
         const serverDir = getServerDir(server);
+        const backupsDir = getLocalBackupsDir(server);
         const tempZipPath = path.join(os.tmpdir(), `void_backup_${server}_${Date.now()}.zip`);
 
         const controller = new AbortController();
-        activeBackupControllers.set(server, controller);
+        registerActiveBackupController(server, controller);
+
+        let fileStream: fs.ReadStream | null = null;
+        const onAbort = () => {
+          try { fileStream?.destroy(); } catch {}
+        };
+        controller.signal.addEventListener('abort', onAbort);
 
         try {
-          // Zip the server folder
+          // Zip the server folder (excluding local backups directory)
           await compressFolder(serverDir, tempZipPath, (percent) => {
-            const overallProgress = Math.round(percent * 0.5);
+            const overallProgress = Math.min(49, Math.max(1, Math.round(percent * 0.5)));
             updateBackupState(server, 'zipping', overallProgress, 'cloud');
-          }, controller.signal);
+          }, controller.signal, backupsDir);
+
+          if (controller.signal.aborted) {
+            throw new Error('Backup aborted');
+          }
 
           const stats = fs.statSync(tempZipPath);
           console.log(`[WebRTC Cloud Backup] Zipped size: ${(stats.size / (1024 * 1024)).toFixed(2)} MB`);
           updateBackupState(server, 'uploading', 50, 'cloud');
 
           // Upload using fetch and stream progress
-          const fileStream = fs.createReadStream(tempZipPath);
+          fileStream = fs.createReadStream(tempZipPath);
+          const streamRef = fileStream;
           const filename = `backup_${Date.now()}.zip`;
 
           let bytesUploaded = 0;
           const totalBytes = stats.size;
 
           const progressTrackingStream = new ReadableStream({
-            start(controller) {
-              fileStream.pause();
-              fileStream.on('data', (chunk: Buffer) => {
+            start(streamController) {
+              streamRef.pause();
+              streamRef.on('data', (chunk: Buffer) => {
+                if (controller.signal.aborted) {
+                  try { streamRef.destroy(); } catch {}
+                  try { streamController.error(new Error('Backup aborted')); } catch {}
+                  return;
+                }
                 bytesUploaded += chunk.length;
-                const pct = Math.round((bytesUploaded / totalBytes) * 100);
+                const pct = totalBytes > 0 ? Math.round((bytesUploaded / totalBytes) * 100) : 0;
                 const overallProgress = Math.min(99, 50 + Math.round(pct * 0.5));
                 updateBackupState(server, 'uploading', overallProgress, 'cloud');
                 
-                controller.enqueue(chunk);
-                if (controller.desiredSize !== null && controller.desiredSize <= 0) {
-                  fileStream.pause();
+                streamController.enqueue(chunk);
+                if (streamController.desiredSize !== null && streamController.desiredSize <= 0) {
+                  streamRef.pause();
                 }
               });
-              fileStream.on('end', () => {
-                controller.close();
+              streamRef.on('end', () => {
+                streamController.close();
               });
-              fileStream.on('error', (err) => {
-                controller.error(err);
+              streamRef.on('error', (err) => {
+                streamController.error(err);
               });
             },
             pull() {
-              fileStream.resume();
+              streamRef.resume();
             },
             cancel() {
-              fileStream.destroy();
+              streamRef.destroy();
             }
           });
 
@@ -2102,21 +3002,22 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
               'Content-Length': totalBytes.toString()
             },
             body: progressTrackingStream,
+            signal: controller.signal,
             // @ts-ignore
             duplex: 'half'
           });
 
           // Clean up temp zip file
           if (fs.existsSync(tempZipPath)) {
-            fs.unlinkSync(tempZipPath);
+            try { fs.unlinkSync(tempZipPath); } catch {}
           }
 
           if (res.status === 507) {
             updateBackupState(server, 'idle', 0, 'idle');
-            channel.send(JSON.stringify({ 
+            broadcastToPeers({ 
               type: 'error', 
               message: 'Our backup servers are currently experiencing high traffic. Please try again later.' 
-            }));
+            });
             break;
           }
 
@@ -2125,22 +3026,30 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             const errMsg = errData.error || `Upload failed with status code ${res.status}`;
             console.error('[WebRTC Cloud Backup Error] Server rejected upload:', errMsg);
             updateBackupState(server, 'idle', 0, 'idle');
-            channel.send(JSON.stringify({ type: 'error', message: errMsg }));
+            broadcastToPeers({ type: 'error', message: errMsg });
             break;
           }
 
           updateBackupState(server, 'idle', 0, 'idle');
-          channel.send(JSON.stringify({ type: 'backup_success', server }));
+          broadcastToPeers({ type: 'backup_success', server });
         } catch (err: any) {
-          console.error('[WebRTC Cloud Backup Error] Exception occurred:', err);
           if (fs.existsSync(tempZipPath)) {
-            fs.unlinkSync(tempZipPath);
+            try { fs.unlinkSync(tempZipPath); } catch {}
           }
+          if (isBackupAbortError(err, controller.signal)) {
+            updateBackupState(server, 'idle', 0, 'idle');
+            broadcastToPeers({ type: 'action_success', action: 'Backup Cancelled' });
+            break;
+          }
+          console.error('[WebRTC Cloud Backup Error] Exception occurred:', err);
           updateBackupState(server, 'idle', 0, 'idle');
-          channel.send(JSON.stringify({ 
+          broadcastToPeers({ 
             type: 'error', 
             message: `Could not connect to backup server: ${err.message}. Our backup servers are currently experiencing high traffic. Please try again later.` 
-          }));
+          });
+        } finally {
+          controller.signal.removeEventListener('abort', onAbort);
+          clearActiveBackupController(server);
         }
         break;
       }
@@ -2190,6 +3099,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'restore_cloud_backup': {
+        if (sendBackupBusyError(channel)) break;
         const { server, filename } = payload;
         const daemonId = getDaemonId();
         const { backupServerUrl, backupToken } = loadBackupConfig();
@@ -2201,11 +3111,13 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
         updateBackupState(server, 'downloading', 0, 'restore_cloud');
         const tempZipPath = path.join(os.tmpdir(), `void_restore_${server}_${Date.now()}.zip`);
+        const controller = new AbortController();
+        registerActiveBackupController(server, controller);
 
         try {
           // Download backup file
           const downloadUrl = `${backupServerUrl}/api/backup/download?nodeId=${daemonId}&serverId=${server}&filename=${filename}&token=${backupToken}`;
-          const res = await fetch(downloadUrl);
+          const res = await fetch(downloadUrl, { signal: controller.signal });
 
           if (!res.ok) {
             throw new Error(`Server returned HTTP ${res.status}`);
@@ -2215,17 +3127,26 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           const totalBytes = parseInt(res.headers.get('content-length') || '0', 10);
           let bytesDownloaded = 0;
 
-          // Pipe fetch body stream to file and track progress
-          // Node fetch response body is a Node Readable stream which also acts as async iterable
-          // @ts-ignore
-          for await (const chunk of res.body) {
-            fileStream.write(chunk);
-            bytesDownloaded += chunk.length;
-            const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 50;
-            const overallProgress = Math.round(pct * 0.9);
-            updateBackupState(server, 'downloading', overallProgress, 'restore_cloud');
+          try {
+            // Pipe fetch body stream to file and track progress
+            // @ts-ignore
+            for await (const chunk of res.body) {
+              if (controller.signal.aborted) {
+                throw new Error('Backup aborted');
+              }
+              fileStream.write(chunk);
+              bytesDownloaded += chunk.length;
+              const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 50;
+              const overallProgress = Math.round(pct * 0.9);
+              updateBackupState(server, 'downloading', overallProgress, 'restore_cloud');
+            }
+          } finally {
+            fileStream.end();
           }
-          fileStream.end();
+
+          if (controller.signal.aborted) {
+            throw new Error('Backup aborted');
+          }
 
           // Unzip/Extract backup
           updateBackupState(server, 'extracting', 90, 'restore_cloud');
@@ -2242,20 +3163,30 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           channel.send(JSON.stringify({ type: 'restore_success', server }));
         } catch (err: any) {
           if (fs.existsSync(tempZipPath)) {
-            fs.unlinkSync(tempZipPath);
+            try { fs.unlinkSync(tempZipPath); } catch {}
+          }
+          if (isBackupAbortError(err, controller.signal)) {
+            updateBackupState(server, 'idle', 0, 'idle');
+            broadcastToPeers({ type: 'action_success', action: 'Backup Cancelled' });
+            break;
           }
           updateBackupState(server, 'idle', 0, 'idle');
           channel.send(JSON.stringify({ type: 'error', message: `Restore failed: ${err.message}` }));
+        } finally {
+          clearActiveBackupController(server);
         }
         break;
       }
 
       case 'restore_backup': {
+        if (sendBackupBusyError(channel)) break;
         const { server, filename, mode, newServerName } = payload;
+        const controller = new AbortController();
+        registerActiveBackupController(server, controller);
+        let finalNewName: string = '';
 
         try {
           let targetDir: string;
-          let finalNewName: string = '';
           let archivedServerName: string | undefined;
 
           // Stop server if currently running
@@ -2283,6 +3214,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
             finalNewName = newServerName?.trim() || `${baseName}-NEW`;
             archivedServerName = oldTargetName;
+            registerActiveBackupController(finalNewName, controller);
 
             const sourceMeta = getServerMeta(server);
             if (!sourceMeta) {
@@ -2308,11 +3240,15 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             }
 
             // 4. Create metadata for the new server
+            const existingSubs = new Set(listServers().map(s => s.subdomain).filter(Boolean) as string[]);
+            const newSub = generateRandomSubdomain(existingSubs);
             const newMeta = {
               ...sourceMeta,
               name: finalNewName,
               createdAt: new Date().toISOString(),
-              statusId: Math.random().toString(36).substring(2, 10) + Math.random().toString(36).substring(2, 10),
+              statusId: slugifyServerName(finalNewName),
+              subdomain: newSub,
+              autoExpose: true,
             };
             saveServerMeta(newMeta);
             targetDir = getServerDir(finalNewName);
@@ -2340,19 +3276,31 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
               updateBackupState(finalNewName, 'downloading', 0, 'restore_cloud');
               const tempZipPath = path.join(os.tmpdir(), `void_restore_${finalNewName}_${Date.now()}.zip`);
               const downloadUrl = `${backupServerUrl}/api/backup/download?nodeId=${daemonId}&serverId=${server}&filename=${filename}&token=${backupToken}`;
-              const res = await fetch(downloadUrl);
+              const res = await fetch(downloadUrl, { signal: controller.signal });
               if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
 
               const fileStream = fs.createWriteStream(tempZipPath);
               const totalBytes = parseInt(res.headers.get('content-length') || '0', 10);
               let bytesDownloaded = 0;
-              for await (const chunk of (res.body as any)) {
-                fileStream.write(chunk);
-                bytesDownloaded += chunk.length;
-                const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 50;
-                updateBackupState(finalNewName, 'downloading', Math.round(pct * 0.9), 'restore_cloud');
+              try {
+                for await (const chunk of (res.body as any)) {
+                  if (controller.signal.aborted) {
+                    if (fs.existsSync(tempZipPath)) try { fs.unlinkSync(tempZipPath); } catch {}
+                    throw new Error('Backup aborted');
+                  }
+                  fileStream.write(chunk);
+                  bytesDownloaded += chunk.length;
+                  const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 50;
+                  updateBackupState(finalNewName, 'downloading', Math.round(pct * 0.9), 'restore_cloud');
+                }
+              } finally {
+                fileStream.end();
               }
-              fileStream.end();
+
+              if (controller.signal.aborted) {
+                if (fs.existsSync(tempZipPath)) try { fs.unlinkSync(tempZipPath); } catch {}
+                throw new Error('Backup aborted');
+              }
 
               updateBackupState(finalNewName, 'extracting', 90, 'restore_cloud');
               await extractArchive(tempZipPath, targetDir);
@@ -2370,14 +3318,20 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
               await extractArchive(backupFileToExtract, targetDir);
             }
 
-            // Synchronize meta.json name in targetDir
+            // Synchronize meta.json in targetDir with new server's identity & subdomain
             const targetMetaPath = path.join(targetDir, 'meta.json');
             if (fs.existsSync(targetMetaPath)) {
               try {
                 const targetMeta = JSON.parse(fs.readFileSync(targetMetaPath, 'utf-8'));
                 targetMeta.name = finalNewName;
+                targetMeta.subdomain = newMeta.subdomain;
+                targetMeta.statusId = newMeta.statusId;
+                targetMeta.autoExpose = true;
+                targetMeta.createdAt = newMeta.createdAt;
                 fs.writeFileSync(targetMetaPath, JSON.stringify(targetMeta, null, 2));
               } catch {}
+            } else {
+              saveServerMeta(newMeta);
             }
 
             updateBackupState(finalNewName, 'idle', 0, 'idle');
@@ -2404,19 +3358,31 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
               updateBackupState(server, 'downloading', 0, 'restore_cloud');
               const tempZipPath = path.join(os.tmpdir(), `void_restore_${server}_${Date.now()}.zip`);
               const downloadUrl = `${backupServerUrl}/api/backup/download?nodeId=${daemonId}&serverId=${server}&filename=${filename}&token=${backupToken}`;
-              const res = await fetch(downloadUrl);
+              const res = await fetch(downloadUrl, { signal: controller.signal });
               if (!res.ok) throw new Error(`Server returned HTTP ${res.status}`);
 
               const fileStream = fs.createWriteStream(tempZipPath);
               const totalBytes = parseInt(res.headers.get('content-length') || '0', 10);
               let bytesDownloaded = 0;
-              for await (const chunk of (res.body as any)) {
-                fileStream.write(chunk);
-                bytesDownloaded += chunk.length;
-                const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 50;
-                updateBackupState(server, 'downloading', Math.round(pct * 0.9), 'restore_cloud');
+              try {
+                for await (const chunk of (res.body as any)) {
+                  if (controller.signal.aborted) {
+                    if (fs.existsSync(tempZipPath)) try { fs.unlinkSync(tempZipPath); } catch {}
+                    throw new Error('Backup aborted');
+                  }
+                  fileStream.write(chunk);
+                  bytesDownloaded += chunk.length;
+                  const pct = totalBytes > 0 ? Math.round((bytesDownloaded / totalBytes) * 100) : 50;
+                  updateBackupState(server, 'downloading', Math.round(pct * 0.9), 'restore_cloud');
+                }
+              } finally {
+                fileStream.end();
               }
-              fileStream.end();
+
+              if (controller.signal.aborted) {
+                if (fs.existsSync(tempZipPath)) try { fs.unlinkSync(tempZipPath); } catch {}
+                throw new Error('Backup aborted');
+              }
 
               updateBackupState(server, 'extracting', 90, 'restore_cloud');
               await extractArchive(tempZipPath, targetDir);
@@ -2435,22 +3401,42 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             channel.send(JSON.stringify({ type: 'restore_success', server, mode }));
           }
         } catch (err: any) {
-          updateBackupState(server, 'idle', 0, 'idle');
+          if (isBackupAbortError(err, controller.signal)) {
+            updateBackupState(finalNewName || server, 'idle', 0, 'idle');
+            broadcastToPeers({ type: 'action_success', action: 'Backup Cancelled' });
+            break;
+          }
+          updateBackupState(finalNewName || server, 'idle', 0, 'idle');
           channel.send(JSON.stringify({ type: 'error', message: `Restore failed: ${err.message}` }));
+        } finally {
+          clearActiveBackupController(server);
+          if (finalNewName) clearActiveBackupController(finalNewName);
         }
         break;
       }
 
       case 'get_local_backup_limit': {
-        const limit = loadLocalBackupLimit();
-        channel.send(JSON.stringify({ type: 'local_backup_limit', limitEnabled: limit.enabled, limitType: limit.type, limitValue: limit.value }));
+        const { server } = payload;
+        const meta = server ? getServerMeta(server) : null;
+        const limit = (meta && meta.localBackupLimit) ? meta.localBackupLimit : loadLocalBackupLimit();
+        channel.send(JSON.stringify({ type: 'local_backup_limit', server, limitEnabled: limit.enabled, limitType: limit.type, limitValue: limit.value }));
         break;
       }
 
       case 'save_local_backup_limit': {
-        const { limitEnabled, limitType, limitValue } = payload;
-        saveLocalBackupLimit({ enabled: limitEnabled ?? true, type: limitType, value: limitValue });
-        channel.send(JSON.stringify({ type: 'local_backup_limit_saved', success: true, limitEnabled: limitEnabled ?? true, limitType, limitValue }));
+        const { server, limitEnabled, limitType, limitValue } = payload;
+        const newLimit = { enabled: limitEnabled ?? true, type: limitType || 'quantity', value: Number(limitValue) || 3 };
+        if (server) {
+          const meta = getServerMeta(server);
+          if (meta) {
+            meta.localBackupLimit = newLimit;
+            saveServerMeta(meta);
+          }
+        } else {
+          saveLocalBackupLimit(newLimit);
+        }
+
+        channel.send(JSON.stringify({ type: 'local_backup_limit_saved', server, success: true, limitEnabled: newLimit.enabled, limitType: newLimit.type, limitValue: newLimit.value }));
         break;
       }
 
@@ -2484,29 +3470,18 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'create_local_backup': {
+        if (sendBackupBusyError(channel)) break;
         const { server } = payload;
         
         const backupsDir = getLocalBackupsDir(server);
         const serverDir = getServerDir(server);
-        const limit = loadLocalBackupLimit();
+        const meta = server ? getServerMeta(server) : null;
+        const limit = (meta && meta.localBackupLimit) ? meta.localBackupLimit : loadLocalBackupLimit();
         
         if (limit.enabled) {
           if (limit.type === 'size_gb') {
             const limitBytes = limit.value * 1024 * 1024 * 1024;
-            let serverDirSize = 0;
-            const calculateSize = (dir: string) => {
-              if (!fs.existsSync(dir)) return;
-              const entries = fs.readdirSync(dir, { withFileTypes: true });
-              for (const entry of entries) {
-                const fullPath = path.join(dir, entry.name);
-                if (entry.isDirectory()) {
-                  calculateSize(fullPath);
-                } else {
-                  serverDirSize += fs.statSync(fullPath).size;
-                }
-              }
-            };
-            calculateSize(serverDir);
+            const serverDirSize = getFastFolderSize(serverDir, backupsDir);
             
             if (serverDirSize > limitBytes) {
               channel.send(JSON.stringify({ type: 'error', message: `Server folder size (${(serverDirSize / (1024*1024*1024)).toFixed(2)} GB) exceeds the total retention limit (${limit.value} GB). Increase limit to create a backup.` }));
@@ -2515,9 +3490,13 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
           }
         }
         
+        if (!fs.existsSync(backupsDir)) {
+          fs.mkdirSync(backupsDir, { recursive: true });
+        }
+
         const backupFilename = `backup_local_${Date.now()}.zip`;
         const finalBackupPath = path.join(backupsDir, backupFilename);
-        const tempBackupPath = path.join(os.tmpdir(), `temp_${backupFilename}`);
+        const tempBackupPath = path.join(backupsDir, `.${backupFilename}.tmp`);
         
         updateBackupState(server, 'zipping', 0, 'local');
         
@@ -2528,11 +3507,17 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
 
           await compressFolder(serverDir, tempBackupPath, (percent) => {
             updateBackupState(server, 'zipping', percent, 'local');
-          }, controller.signal);
+          }, controller.signal, backupsDir);
           
-          // Move the complete zip to the local backups directory
-          fs.copyFileSync(tempBackupPath, finalBackupPath);
-          fs.unlinkSync(tempBackupPath);
+          // Move the complete zip to the local backups directory instantly
+          if (fs.existsSync(tempBackupPath)) {
+            try {
+              fs.renameSync(tempBackupPath, finalBackupPath);
+            } catch {
+              fs.copyFileSync(tempBackupPath, finalBackupPath);
+              fs.unlinkSync(tempBackupPath);
+            }
+          }
           
           const files = fs.readdirSync(backupsDir)
             .filter(f => f.startsWith('backup_') && f.endsWith('.zip'))
@@ -2570,9 +3555,6 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
             }
           }
           
-          updateBackupState(server, 'idle', 0, 'idle');
-          channel.send(JSON.stringify({ type: 'local_backup_success', server }));
-          
           const updatedFiles = fs.readdirSync(backupsDir);
           const backups = updatedFiles
             .filter(f => f.startsWith('backup_') && f.endsWith('.zip'))
@@ -2586,32 +3568,53 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
               };
             });
           backups.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-          channel.send(JSON.stringify({ type: 'local_backups_list', server, backups }));
+
+          updateBackupState(server, 'idle', 0, 'idle');
+          invalidateServerDiskCache(server);
+          void sendServersList();
+          broadcastToPeers({ type: 'local_backup_success', server });
+          broadcastToPeers({ type: 'local_backups_list', server, backups });
           activeBackupControllers.delete(server);
         } catch (err: any) {
           activeBackupControllers.delete(server);
           if (fs.existsSync(tempBackupPath)) {
-            fs.unlinkSync(tempBackupPath);
+            try { fs.unlinkSync(tempBackupPath); } catch {}
           }
           
           if (err.name === 'AbortError' || err.message === 'Backup aborted') {
             updateBackupState(server, 'idle', 0, 'idle');
-            channel.send(JSON.stringify({ type: 'action_success', action: 'Backup Cancelled' }));
+            broadcastToPeers({ type: 'action_success', action: 'Backup Cancelled' });
             return;
           }
           
           updateBackupState(server, 'idle', 0, 'idle');
-          channel.send(JSON.stringify({ type: 'error', message: `Local backup failed: ${err.message}` }));
+          broadcastToPeers({ type: 'error', message: `Local backup failed: ${err.message}` });
         }
         break;
       }
 
       case 'cancel_backup': {
         const { server } = payload;
-        const controller = activeBackupControllers.get(server);
+        let controller = server ? activeBackupControllers.get(server) : undefined;
+        let matchedKey: string | undefined = server;
+        if (!controller && server) {
+          for (const [k, c] of activeBackupControllers.entries()) {
+            if (k.toLowerCase() === String(server).toLowerCase()) {
+              controller = c;
+              matchedKey = k;
+              break;
+            }
+          }
+        }
         if (controller) {
           controller.abort();
-          activeBackupControllers.delete(server);
+          if (matchedKey) clearActiveBackupController(matchedKey);
+        } else if (
+          activeBackupState.status !== 'idle' &&
+          (!server || activeBackupState.server.toLowerCase() === String(server).toLowerCase())
+        ) {
+          updateBackupState(activeBackupState.server, 'idle', 0, 'idle');
+          broadcastToPeers({ type: 'action_success', action: 'Backup Cancelled' });
         }
         break;
       }
@@ -2652,6 +3655,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       }
 
       case 'restore_local_backup': {
+        if (sendBackupBusyError(channel)) break;
         const { server, filename } = payload;
         const backupsDir = getLocalBackupsDir(server);
         const filePath = path.join(backupsDir, filename);
@@ -2681,15 +3685,97 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
         }
         break;
       }
+
+      case 'get_server_backup_dir': {
+        const { server } = payload;
+        const meta = getServerMeta(server);
+        const defaultDir = path.join(getServerDir(server), 'backups');
+        const effectiveDir = (meta?.backupDir && meta.backupDir.trim()) || defaultDir;
+        channel.send(JSON.stringify({
+          type: 'server_backup_dir',
+          server,
+          backupDir: meta?.backupDir || null,
+          defaultDir,
+          effectiveDir,
+          defaultBackupDir: defaultDir
+        }));
+        break;
+      }
+
+      case 'set_server_backup_dir': {
+        const { server, backupDir } = payload;
+        const meta = getServerMeta(server);
+        if (meta) {
+          meta.backupDir = backupDir ? String(backupDir).trim() : undefined;
+          saveServerMeta(meta);
+          invalidateServerDiskCache(server);
+          void sendServersList();
+          const defaultDir = path.join(getServerDir(server), 'backups');
+          const effectiveDir = (meta.backupDir && meta.backupDir.trim()) || defaultDir;
+          channel.send(JSON.stringify({
+            type: 'server_backup_dir_saved',
+            server,
+            backupDir: meta.backupDir || null,
+            defaultDir,
+            effectiveDir,
+            success: true
+          }));
+        } else {
+          channel.send(JSON.stringify({ type: 'error', message: `Server ${server} not found` }));
+        }
+        break;
+      }
+
+      case 'get_system_drives': {
+        try {
+          const drives = getSystemDrives();
+          channel.send(JSON.stringify({
+            type: 'system_drives',
+            drives,
+            platform: process.platform
+          }));
+        } catch (err: any) {
+          channel.send(JSON.stringify({ type: 'error', message: `Failed to get system drives: ${err.message}` }));
+        }
+        break;
+      }
+
+      case 'browse_directories': {
+        const { path: reqPath } = payload;
+        try {
+          const result = browseHostDirectories(reqPath);
+          channel.send(JSON.stringify({
+            type: 'browse_directories_result',
+            ...result
+          }));
+        } catch (err: any) {
+          channel.send(JSON.stringify({ type: 'error', message: `Browse failed: ${err.message}` }));
+        }
+        break;
+      }
+
+      case 'create_directory': {
+        const { parentPath, folderName } = payload;
+        try {
+          const createdPath = createHostDirectory(parentPath, folderName);
+          const result = browseHostDirectories(createdPath);
+          channel.send(JSON.stringify({
+            type: 'create_directory_result',
+            createdPath,
+            ...result
+          }));
+        } catch (err: any) {
+          channel.send(JSON.stringify({ type: 'error', message: `Create folder failed: ${err.message}` }));
+        }
+        break;
+      }
+
       // ── Schedule ────────────────────────────────────────────────────
       case 'schedule_save': {
         const { server, schedules } = payload;
         try {
-          const scheduleDir = path.join(getServerDir(''), '.schedules');
-          if (!fs.existsSync(scheduleDir)) fs.mkdirSync(scheduleDir, { recursive: true });
-          const filePath = path.join(scheduleDir, `${server}.json`);
-          fs.writeFileSync(filePath, JSON.stringify(schedules || [], null, 2));
-          channel.send(JSON.stringify({ action: 'schedule_save_success', server, schedules }));
+          saveSchedules(server, schedules || []);
+          channel.send(JSON.stringify({ action: 'schedule_save_success', server, schedules: getSchedules(server) }));
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: `Schedule save failed: ${err.message}` }));
         }
@@ -2698,9 +3784,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'schedule_list': {
         const { server } = payload;
         try {
-          const scheduleDir = path.join(getServerDir(''), '.schedules');
-          const filePath = path.join(scheduleDir, `${server}.json`);
-          const schedules = fs.existsSync(filePath) ? JSON.parse(fs.readFileSync(filePath, 'utf-8')) : [];
+          const schedules = getSchedules(server);
           channel.send(JSON.stringify({ action: 'schedule_list', server, schedules }));
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: err.message }));
@@ -2710,9 +3794,7 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'schedule_logs': {
         const { server } = payload;
         try {
-          const scheduleDir = path.join(getServerDir(''), '.schedules');
-          const logPath = path.join(scheduleDir, `${server}_logs.json`);
-          const logs: any[] = fs.existsSync(logPath) ? JSON.parse(fs.readFileSync(logPath, 'utf-8')) : [];
+          const logs = getScheduleLogs(server);
           channel.send(JSON.stringify({ action: 'schedule_logs', server, logs }));
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: err.message }));
@@ -2722,12 +3804,24 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'schedule_logs_clear': {
         const { server } = payload;
         try {
-          const scheduleDir = path.join(getServerDir(''), '.schedules');
-          const logPath = path.join(scheduleDir, `${server}_logs.json`);
-          if (fs.existsSync(logPath)) fs.unlinkSync(logPath);
+          clearScheduleLogs(server);
           channel.send(JSON.stringify({ action: 'schedule_logs_clear_success', server }));
         } catch (err: any) {
           channel.send(JSON.stringify({ type: 'error', message: err.message }));
+        }
+        break;
+      }
+      case 'run_schedule_now': {
+        const { server, scheduleId } = payload;
+        try {
+          const success = await runScheduleNow(server, scheduleId);
+          if (success) {
+            channel.send(JSON.stringify({ action: 'run_schedule_now_success', server, scheduleId }));
+          } else {
+            channel.send(JSON.stringify({ type: 'error', message: `Schedule not found or failed to execute` }));
+          }
+        } catch (err: any) {
+          channel.send(JSON.stringify({ type: 'error', message: `Run schedule failed: ${err.message}` }));
         }
         break;
       }
@@ -2967,6 +4061,17 @@ async function handleClientMessage(channel: any, message: string, transfers: Map
       case 'update_cli': {
         channel.send(JSON.stringify({ type: 'action_info', action: 'Update started — stopping all servers…' }));
         performUpdateCli();
+        break;
+      }
+
+      default: {
+        if (payload.action) {
+          channel.send(JSON.stringify({
+            type: 'error',
+            action: payload.action,
+            message: `Unsupported daemon action: ${payload.action}`,
+          }));
+        }
         break;
       }
     }

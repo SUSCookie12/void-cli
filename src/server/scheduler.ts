@@ -6,7 +6,12 @@ import { listServers, getServerMeta } from './manager.js';
 import { startServer, stopServer, restartServer, sendCommand, isRunning, getServerStatus, isEulaAccepted } from './instance.js';
 import { loadBackupConfig } from '../auth/session.js';
 import { compressFolder } from '../utils/zipper.js';
-import { broadcastToWebRtc } from '../network/webrtc.js';
+import {
+  broadcastToWebRtc,
+  updateBackupState,
+  registerActiveBackupController,
+  clearActiveBackupController,
+} from '../network/webrtc.js';
 
 export interface ScheduleNode {
   id: string;
@@ -95,26 +100,56 @@ function getNextCronOccurrence(cronExpr: string, fromDate = new Date()): Date {
   throw new Error('No cron occurrence within 5 years');
 }
 
-function computeNextRunTime(node: ScheduleNode, baseDate = new Date()): Date {
+export function computeNextRunTime(node: ScheduleNode, baseDate = new Date()): Date {
   const now = baseDate.getTime();
-  if (node.scheduleType === 'interval') return new Date(now + node.intervalMinutes * 60 * 1000);
+  if (node.scheduleType === 'interval') {
+    const mins = Math.max(1, Math.floor(Number(node.intervalMinutes) || 30));
+    return new Date(now + mins * 60 * 1000);
+  }
   if (node.scheduleType === 'time') {
     const d = new Date(now);
-    d.setHours(node.hour, node.minute, node.second, 0);
-    if (d.getTime() <= now) d.setDate(d.getDate() + 1);
+    const hour = Math.min(23, Math.max(0, Math.floor(Number(node.hour) || 0)));
+    const minute = Math.min(59, Math.max(0, Math.floor(Number(node.minute) || 0)));
+    const second = Math.min(59, Math.max(0, Math.floor(Number(node.second) || 0)));
+    d.setHours(hour, minute, second, 0);
+    while (d.getTime() <= now) {
+      d.setDate(d.getDate() + 1);
+    }
     return d;
   }
   if (node.scheduleType === 'cron') {
-    try { return getNextCronOccurrence(node.cronExpr, baseDate); }
-    catch { return new Date(now + 60000); }
+    try {
+      const next = getNextCronOccurrence(node.cronExpr, baseDate);
+      if (next.getTime() > now) return next;
+    } catch {}
+    return new Date(now + 60000);
   }
   return new Date(now + 60000);
 }
 
-function getSchedulesDir(): string {
+export function getSchedulesDir(): string {
   const dir = path.join(getServersDir(), '.schedules');
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+export function getScheduleLogs(serverName: string): ScheduleLog[] {
+  const logPath = path.join(getSchedulesDir(), `${serverName}_logs.json`);
+  if (!fs.existsSync(logPath)) return [];
+  try {
+    const data = JSON.parse(fs.readFileSync(logPath, 'utf-8'));
+    return Array.isArray(data) ? data : [];
+  } catch {
+    return [];
+  }
+}
+
+export function clearScheduleLogs(serverName: string): void {
+  const logPath = path.join(getSchedulesDir(), `${serverName}_logs.json`);
+  if (fs.existsSync(logPath)) {
+    try { fs.unlinkSync(logPath); } catch {}
+  }
+  broadcastToWebRtc({ action: 'schedule_logs', server: serverName, logs: [] });
 }
 
 function writeLog(serverName: string, log: ScheduleLog) {
@@ -129,14 +164,35 @@ function writeLog(serverName: string, log: ScheduleLog) {
   fs.writeFileSync(logPath, JSON.stringify(logs, null, 2));
   broadcastToWebRtc({ action: 'schedule_logs', server: serverName, logs });
 }
- 
-function saveSchedules(serverName: string, schedules: ScheduleNode[]) {
+
+export function getSchedules(serverName: string): ScheduleNode[] {
   const filePath = path.join(getSchedulesDir(), `${serverName}.json`);
-  fs.writeFileSync(filePath, JSON.stringify(schedules, null, 2));
-  broadcastToWebRtc({ action: 'schedule_list', server: serverName, schedules });
+  if (!fs.existsSync(filePath)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+    return Array.isArray(raw) ? raw : [];
+  } catch {
+    return [];
+  }
 }
 
-async function runScheduleAction(
+export function saveSchedules(serverName: string, schedules: ScheduleNode[]) {
+  const filePath = path.join(getSchedulesDir(), `${serverName}.json`);
+  const now = new Date();
+  // Ensure valid nextRun timestamps for active schedules
+  const normalized = (schedules || []).map(s => {
+    if (s.enabled) {
+      if (!s.nextRun || isNaN(new Date(s.nextRun).getTime())) {
+        return { ...s, nextRun: computeNextRunTime(s, now).toISOString() };
+      }
+    }
+    return s;
+  });
+  fs.writeFileSync(filePath, JSON.stringify(normalized, null, 2));
+  broadcastToWebRtc({ action: 'schedule_list', server: serverName, schedules: normalized });
+}
+
+export async function runScheduleAction(
   serverName: string,
   schedule: ScheduleNode,
   logId: string,
@@ -147,29 +203,73 @@ async function runScheduleAction(
     writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'failed', message: `Server metadata not found for "${serverName}"`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
     return;
   }
+  if (meta.isFrozen) {
+    writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'failed', message: `Server "${serverName}" is frozen in cold storage. Scheduled tasks are paused while frozen.`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+    return;
+  }
   try {
     switch (schedule.action) {
       case 'command': {
-        if (!schedule.command) throw new Error('Command string is empty');
-        const success = sendCommand(serverName, schedule.command);
-        if (!success) throw new Error('Server console not accessible');
-        writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: `Executed command: ${schedule.command}`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+        if (!schedule.command || !schedule.command.trim()) throw new Error('Command string is empty');
+        const cmd = schedule.command.trim();
+        if (!isRunning(serverName)) {
+          writeLog(serverName, {
+            id: logId,
+            scheduleId: schedule.id,
+            scheduleName: schedule.name,
+            action: schedule.action,
+            status: 'failed',
+            message: `Skipped: Server "${serverName}" is offline. Console commands require the server to be online.`,
+            details: `Scheduled command "${cmd}" could not be sent because the Minecraft process is currently stopped.`,
+            triggeredAt: triggeredAt.toISOString(),
+            completedAt: new Date().toISOString()
+          });
+          return;
+        }
+        const success = sendCommand(serverName, cmd);
+        if (!success) throw new Error('Failed to dispatch command to server stdin stream');
+        writeLog(serverName, {
+          id: logId,
+          scheduleId: schedule.id,
+          scheduleName: schedule.name,
+          action: schedule.action,
+          status: 'success',
+          message: `Executed command: ${cmd}`,
+          details: `Successfully dispatched to Minecraft console.`,
+          triggeredAt: triggeredAt.toISOString(),
+          completedAt: new Date().toISOString()
+        });
         break;
       }
       case 'start': {
+        if (isRunning(serverName)) {
+          writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server is already running', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+          break;
+        }
         if (!isEulaAccepted(serverName)) throw new Error('Minecraft EULA not accepted — cannot start server via scheduler');
         await startServer(meta);
-        writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server start requested', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+        writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server start requested successfully', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
         break;
       }
       case 'stop': {
+        if (!isRunning(serverName)) {
+          writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server is already stopped', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+          break;
+        }
         stopServer(serverName);
-        writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server stop requested', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+        writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server stop requested successfully', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
         break;
       }
       case 'restart': {
-        restartServer(serverName);
-        writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server restart requested', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+        if (!isRunning(serverName)) {
+          // If server was offline, cleanly start it rather than doing nothing!
+          if (!isEulaAccepted(serverName)) throw new Error('Minecraft EULA not accepted — cannot start server via scheduler');
+          await startServer(meta);
+          writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server was offline; started server via scheduled reboot', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+        } else {
+          restartServer(serverName);
+          writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: 'Server restart requested successfully', triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+        }
         break;
       }
       case 'backup': {
@@ -185,31 +285,66 @@ async function runScheduleAction(
           }
         }
         let zipFilename = '';
-        if (target === 'local') {
-          const backupsDir = getLocalBackupsDir(serverName);
-          zipFilename = `backup_scheduled_${Date.now()}.zip`;
-          const destPath = path.join(backupsDir, zipFilename);
-          await compressFolder(getServerDir(serverName), destPath);
-          writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: `Created local backup: ${zipFilename}`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
-        } else {
-          const { backupServerUrl, backupToken } = loadBackupConfig();
-          if (!backupServerUrl || !backupToken) throw new Error('Cloud backup not configured on this host');
-          zipFilename = `backup_cloud_scheduled_${Date.now()}.zip`;
-          const tempPath = path.join(os.tmpdir(), zipFilename);
-          await compressFolder(getServerDir(serverName), tempPath);
-          const fileBuffer = fs.readFileSync(tempPath);
-          const uploadRes = await fetch(`${backupServerUrl}/api/backup/upload`, {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${backupToken}`, 'x-node-id': '', 'x-server-id': serverName, 'x-filename': zipFilename, 'Content-Length': fileBuffer.length.toString() },
-            body: fileBuffer,
-          });
-          fs.unlinkSync(tempPath);
-          if (!uploadRes.ok) { const t = await uploadRes.text().catch(() => uploadRes.statusText); throw new Error(`Cloud upload failed: ${t}`); }
-          writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: `Created cloud backup: ${zipFilename}`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
-        }
-        if (startAfter && (wasRunningBefore || startAfter)) {
-          if (!isEulaAccepted(serverName)) throw new Error('Minecraft EULA not accepted — cannot restart after backup via scheduler');
-          await startServer(meta);
+        const controller = new AbortController();
+        registerActiveBackupController(serverName, controller);
+        const backupsDir = getLocalBackupsDir(serverName);
+        try {
+          if (target === 'local') {
+            if (!fs.existsSync(backupsDir)) fs.mkdirSync(backupsDir, { recursive: true });
+            zipFilename = `backup_scheduled_${Date.now()}.zip`;
+            const destPath = path.join(backupsDir, zipFilename);
+            updateBackupState(serverName, 'zipping', 0, 'local');
+            try {
+              await compressFolder(
+                getServerDir(serverName),
+                destPath,
+                (percent) => updateBackupState(serverName, 'zipping', percent, 'local'),
+                controller.signal,
+                backupsDir
+              );
+            } catch (err) {
+              try { if (fs.existsSync(destPath)) fs.unlinkSync(destPath); } catch {}
+              throw err;
+            }
+            writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: `Created local backup: ${zipFilename}`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+          } else {
+            const { backupServerUrl, backupToken } = loadBackupConfig();
+            if (!backupServerUrl || !backupToken) throw new Error('Cloud backup not configured on this host');
+            zipFilename = `backup_cloud_scheduled_${Date.now()}.zip`;
+            const tempPath = path.join(os.tmpdir(), zipFilename);
+            updateBackupState(serverName, 'zipping', 0, 'cloud');
+            try {
+              await compressFolder(
+                getServerDir(serverName),
+                tempPath,
+                (percent) => updateBackupState(serverName, 'zipping', Math.min(49, Math.max(1, Math.round(percent * 0.5))), 'cloud'),
+                controller.signal,
+                backupsDir
+              );
+              if (controller.signal.aborted) throw new Error('Backup aborted');
+              updateBackupState(serverName, 'uploading', 50, 'cloud');
+              const fileBuffer = fs.readFileSync(tempPath);
+              const uploadRes = await fetch(`${backupServerUrl}/api/backup/upload`, {
+                method: 'POST',
+                headers: { 'Authorization': `Bearer ${backupToken}`, 'x-node-id': '', 'x-server-id': serverName, 'x-filename': zipFilename, 'Content-Length': fileBuffer.length.toString() },
+                body: fileBuffer,
+                signal: controller.signal,
+              });
+              try { fs.unlinkSync(tempPath); } catch {}
+              if (!uploadRes.ok) { const t = await uploadRes.text().catch(() => uploadRes.statusText); throw new Error(`Cloud upload failed: ${t}`); }
+            } catch (err) {
+              try { if (fs.existsSync(tempPath)) fs.unlinkSync(tempPath); } catch {}
+              throw err;
+            }
+            writeLog(serverName, { id: logId, scheduleId: schedule.id, scheduleName: schedule.name, action: schedule.action, status: 'success', message: `Created cloud backup: ${zipFilename}`, triggeredAt: triggeredAt.toISOString(), completedAt: new Date().toISOString() });
+          }
+          if (startAfter && (wasRunningBefore || startAfter)) {
+            if (!isEulaAccepted(serverName)) throw new Error('Minecraft EULA not accepted — cannot restart after backup via scheduler');
+            await startServer(meta);
+          }
+        } finally {
+          clearActiveBackupController(serverName);
+          updateBackupState(serverName, 'idle', 0, 'idle');
         }
         break;
       }
@@ -219,43 +354,85 @@ async function runScheduleAction(
   }
 }
 
+export async function runScheduleNow(serverName: string, scheduleId: string): Promise<boolean> {
+  const schedules = getSchedules(serverName);
+  const schedule = schedules.find(s => s.id === scheduleId);
+  if (!schedule) return false;
+
+  const logId = Math.random().toString(36).substring(2, 10);
+  const now = new Date();
+  schedule.lastRun = now.toISOString();
+
+  if (schedule.repeat) {
+    let next = computeNextRunTime(schedule, now);
+    if (next.getTime() <= now.getTime()) {
+      next = new Date(now.getTime() + 60000);
+    }
+    schedule.nextRun = next.toISOString();
+  } else {
+    schedule.enabled = false;
+    schedule.nextRun = null;
+  }
+
+  saveSchedules(serverName, schedules);
+  await runScheduleAction(serverName, schedule, logId, now);
+  return true;
+}
+
 export function startScheduler(): () => void {
   console.log('[void_server/scheduler] Background scheduler is active.');
   const intervalId = setInterval(async () => {
-    const servers = listServers();
-    for (const server of servers) {
-      const filePath = path.join(getSchedulesDir(), `${server.name}.json`);
-      if (!fs.existsSync(filePath)) continue;
-      let schedules: ScheduleNode[] = [];
-      try { schedules = JSON.parse(fs.readFileSync(filePath, 'utf-8')); }
-      catch { continue; }
-      let modified = false;
-      for (const schedule of schedules) {
-        if (!schedule.enabled) continue;
+    try {
+      const servers = listServers();
+      for (const server of servers) {
+        if (server.isFrozen) continue;
+        const filePath = path.join(getSchedulesDir(), `${server.name}.json`);
+        if (!fs.existsSync(filePath)) continue;
+        let schedules: ScheduleNode[] = [];
+        try { schedules = JSON.parse(fs.readFileSync(filePath, 'utf-8')); }
+        catch { continue; }
+        if (!Array.isArray(schedules)) continue;
+
+        let modified = false;
         const now = new Date();
-        if (!schedule.nextRun) {
-          schedule.nextRun = computeNextRunTime(schedule, now).toISOString();
-          modified = true;
-          continue;
-        }
-        const nextRunDate = new Date(schedule.nextRun);
-        if (nextRunDate.getTime() <= now.getTime()) {
-          const logId = Math.random().toString(36).substring(2, 10);
-          const triggeredAt = now;
-          schedule.lastRun = triggeredAt.toISOString();
-          if (schedule.repeat) {
+
+        for (const schedule of schedules) {
+          if (!schedule.enabled) continue;
+
+          // Repair missing or corrupt nextRun
+          if (!schedule.nextRun || isNaN(new Date(schedule.nextRun).getTime())) {
             schedule.nextRun = computeNextRunTime(schedule, now).toISOString();
-          } else {
-            schedule.enabled = false;
-            schedule.nextRun = null;
+            modified = true;
+            continue;
           }
-          modified = true;
-          void runScheduleAction(server.name, schedule, logId, triggeredAt);
+
+          const nextRunDate = new Date(schedule.nextRun);
+          if (nextRunDate.getTime() <= now.getTime()) {
+            const logId = Math.random().toString(36).substring(2, 10);
+            const triggeredAt = now;
+            schedule.lastRun = triggeredAt.toISOString();
+
+            if (schedule.repeat) {
+              let next = computeNextRunTime(schedule, now);
+              if (next.getTime() <= now.getTime()) {
+                next = new Date(now.getTime() + 60000);
+              }
+              schedule.nextRun = next.toISOString();
+            } else {
+              schedule.enabled = false;
+              schedule.nextRun = null;
+            }
+            modified = true;
+            void runScheduleAction(server.name, schedule, logId, triggeredAt);
+          }
         }
+        if (modified) saveSchedules(server.name, schedules);
       }
-      if (modified) saveSchedules(server.name, schedules);
+    } catch (err: any) {
+      console.error('[void_server/scheduler] Tick loop error:', err);
     }
   }, 5000);
+
   return () => {
     console.log('[void_server/scheduler] Stopping background scheduler.');
     clearInterval(intervalId);

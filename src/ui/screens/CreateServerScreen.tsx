@@ -206,7 +206,6 @@ export const CreateServerScreen: React.FC<Props> = ({ onDone, onBack }) => {
               { label: '  Vanilla    (Official Mojang server — no plugins)', value: 'vanilla' },
               { label: '  Fabric     (Mod loader — add Fabric mods in /mods)', value: 'fabric' },
               { label: '  Forge      (Mod loader — add Forge mods in /mods)', value: 'forge' },
-              { label: '  Purpur     (Paper fork — enhanced features, plugin support)', value: 'purpur' },
               { label: '  NeoForge   (Next-gen Forge — mod loader)', value: 'neoforge' },
               { label: '  Quilt      (Fabric fork — modern mod loader)', value: 'quilt' },
             ]}
